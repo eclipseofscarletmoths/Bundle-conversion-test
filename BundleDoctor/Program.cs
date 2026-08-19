@@ -1,22 +1,34 @@
 // BundleDoctor/Program.cs
 //
-// POC: doctors a Limbus Company DESKTOP asset bundle into an iOS-loadable one.
+// Doctors a Limbus Company DESKTOP asset bundle into an iOS-loadable one.
 //   - retargets SerializedFile m_TargetPlatform 19 (StandaloneWindows64) -> 9 (iOS)
 //   - re-encodes any Texture2D whose format iOS can't sample (DXT1/DXT5/DXT5Crunched/RGB24)
 //     into RGBA32, leaving already-iOS-safe formats (RGBA32, ASTC 4x4/6x6) untouched
-//   - handles both inline image data and streamed (.resS) texture data
+//   - decoding is done by AssetsTools.NET.Texture itself (it ports detex's DXT1/DXT5/BC7/
+//     ETC1/ETC2 decoders), so no external Texture2DDecoder dependency is needed
+//   - converted textures are moved OUT of .resS and into inline "image data" so we never
+//     have to hand-roll .resS byte-offset patching inside a bundle container. That hand-rolled
+//     path (ReadFromResS/AppendToResS/AppendToNode/ReplaceNode in the previous draft) doesn't
+//     correspond to any real AssetsTools.NET API and is almost certainly why earlier attempts
+//     produced corrupted bundles -- those methods don't exist on AssetBundleFile.
 //
 // Deps (NuGet):
-//   AssetsTools.NET, AssetsTools.NET.Texture   (schema-driven field access, no manual offsets)
-//   Texture2DDecoder (K0lb3/AssetStudio-style native decode bindings for DXT1/DXT5/BC7/etc.)
+//   AssetsTools.NET          - core read/write, replacers
+//   AssetsTools.NET.Texture  - TextureFile helper (decode DXT1/DXT5/DXT5Crunched/RGB24/etc.)
 //
-// Usage: BundleDoctor <input.bundle> <output.bundle>
+// Usage: BundleDoctor <input.bundle> <output.bundle> [classdata.tpk]
+//
+// The classdata.tpk arg is optional. AssetBundles built by Unity normally embed their own
+// type trees, so GetBaseField usually works without one. If you hit a "type template not
+// found" / mono type exception, download a matching tpk from the AssetRipper/Tpk repo, check
+// it into the repo, and pass its path as the 3rd arg -- LoadClassPackage + LoadClassDatabase-
+// FromPackage(af.Metadata.UnityVersion) get called automatically when it's supplied.
 
 using System;
 using System.IO;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
-using Kyaru.Texture2DDecoder; // thin wrapper around Texture2DDecoder's DecodeDXT1/DecodeDXT5/UnpackCrunch
+using AssetsTools.NET.Texture;
 
 internal static class Program
 {
@@ -37,116 +49,136 @@ internal static class Program
     {
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("usage: BundleDoctor <input.bundle> <output.bundle>");
+            Console.Error.WriteLine("usage: BundleDoctor <input.bundle> <output.bundle> [classdata.tpk]");
             return 2;
         }
 
         string inputPath = args[0];
         string outputPath = args[1];
+        string? tpkPath = args.Length > 2 ? args[2] : null;
 
         var manager = new AssetsManager();
+        if (tpkPath != null)
+        {
+            manager.LoadClassPackage(tpkPath);
+        }
 
-        // Bundles are loaded as a container (UnityFS) holding one or more SerializedFiles.
-        BundleFileInstance bundleInst = manager.LoadBundleFile(inputPath, unpackIfPacked: true);
-        AssetBundleFile bundle = bundleInst.file;
+        BundleFileInstance bunInst = manager.LoadBundleFile(inputPath, unpackIfPacked: true);
+        AssetBundleFile bundle = bunInst.file;
 
         int convertedCount = 0;
         int totalTextures = 0;
+        int touchedFiles = 0;
 
         for (int dirIndex = 0; dirIndex < bundle.BlockAndDirInfo.DirectoryInfos.Count; dirIndex++)
         {
             var dirInfo = bundle.BlockAndDirInfo.DirectoryInfos[dirIndex];
-            if (!dirInfo.Name.EndsWith(".resS") && LooksLikeSerializedFile(bundle, dirIndex))
+            if (!LooksLikeSerializedFile(dirInfo.Name))
+                continue;
+
+            AssetsFileInstance afileInst;
+            try
             {
-                AssetsFileInstance afi = manager.LoadAssetsFileFromBundle(bundleInst, dirIndex, loadDeps: false);
-                AssetsFile af = afi.file;
+                afileInst = manager.LoadAssetsFileFromBundle(bunInst, dirIndex, loadDeps: false);
+            }
+            catch (Exception)
+            {
+                // Not every non-.resS entry is necessarily a serialized file (e.g. loose
+                // .resource blobs with no recognizable suffix) -- skip anything that fails
+                // to parse as one rather than guessing.
+                continue;
+            }
 
-                // --- 1. Retarget platform -----------------------------------------
-                if (af.Metadata.TargetPlatform == kTargetWindows64)
-                {
-                    af.Metadata.TargetPlatform = kTargetIOS;
-                }
+            AssetsFile af = afileInst.file;
 
-                // --- 2. Walk Texture2D objects -------------------------------------
-                var texInfos = af.GetAssetsOfType(AssetClassID.Texture2D);
-                foreach (AssetFileInfo info in texInfos)
-                {
-                    totalTextures++;
-                    AssetTypeValueField baseField = manager.GetBaseField(afi, info);
+            if (tpkPath != null)
+            {
+                manager.LoadClassDatabaseFromPackage(af.Metadata.UnityVersion);
+            }
 
-                    int format = baseField["m_TextureFormat"].AsInt;
-                    if (!NeedsConversion(format))
-                        continue; // already RGBA32/ASTC — leave completely untouched
+            bool fileTouched = false;
 
-                    int width = baseField["m_Width"].AsInt;
-                    int height = baseField["m_Height"].AsInt;
+            // --- 1. Retarget platform ---------------------------------------------
+            if (af.Metadata.TargetPlatform == kTargetWindows64)
+            {
+                af.Metadata.TargetPlatform = kTargetIOS;
+                fileTouched = true;
+            }
 
-                    AssetTypeValueField streamData = baseField["m_StreamData"];
-                    string streamPath = streamData["path"].AsString;
-                    bool isStreamed = !string.IsNullOrEmpty(streamPath);
+            // --- 2. Walk Texture2D objects ------------------------------------------
+            foreach (AssetFileInfo info in af.GetAssetsOfType(AssetClassID.Texture2D))
+            {
+                totalTextures++;
+                AssetTypeValueField baseField = manager.GetBaseField(afileInst, info);
 
-                    byte[] sourceBytes;
-                    if (isStreamed)
-                    {
-                        long offset = (long)streamData["offset"].AsULong;
-                        int size = streamData["size"].AsInt;
-                        sourceBytes = ReadFromResS(bundle, streamPath, offset, size);
-                    }
-                    else
-                    {
-                        sourceBytes = baseField["image data"].AsByteArray;
-                    }
+                int format = baseField["m_TextureFormat"].AsInt;
+                if (!NeedsConversion(format))
+                    continue; // already RGBA32/ASTC -- leave completely untouched
 
-                    byte[] rgba32;
-                    using (var pool = new AutoreleaseScope())
-                    {
-                        rgba32 = DecodeToRGBA32(sourceBytes, width, height, format);
-                    }
+                int width = baseField["m_Width"].AsInt;
+                int height = baseField["m_Height"].AsInt;
+                string texName = baseField["m_Name"].AsString;
 
-                    if (rgba32.Length != width * height * 4)
-                        throw new InvalidDataException(
-                            $"decoded size mismatch for {baseField["m_Name"].AsString}: " +
-                            $"got {rgba32.Length}, expected {width * height * 4}");
+                // TextureFile.ReadTextureFile + GetTextureData resolve streamed (.resS) data
+                // automatically when the base field came from a bundle-loaded AssetsFileInstance,
+                // and fall back to inline "image data" otherwise -- no manual offset math needed.
+                TextureFile tf = TextureFile.ReadTextureFile(baseField);
+                byte[] bgra32 = tf.GetTextureData(afileInst)
+                    ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
 
-                    // --- 3. Patch fields back via the type tree (no offset math) ---
-                    baseField["m_TextureFormat"].AsInt = kFmtRGBA32;
-                    baseField["m_MipCount"].AsInt = 1;
-                    baseField["m_CompleteImageSize"].AsInt = rgba32.Length;
+                if (bgra32.Length != width * height * 4)
+                    throw new InvalidDataException(
+                        $"decoded size mismatch for '{texName}': got {bgra32.Length}, " +
+                        $"expected {width * height * 4}");
 
-                    if (isStreamed)
-                    {
-                        // Keep it streamed: append to the bundle's .resS node instead of
-                        // inflating the serialized object (matches the "disk, not RAM" rule).
-                        long newOffset = AppendToResS(bundle, streamPath, rgba32);
-                        streamData["offset"].AsULong = (ulong)newOffset;
-                        streamData["size"].AsInt = rgba32.Length;
-                        baseField["image data"].AsByteArray = Array.Empty<byte>();
-                    }
-                    else
-                    {
-                        baseField["image data"].AsByteArray = rgba32;
-                        streamData["offset"].AsULong = 0;
-                        streamData["size"].AsInt = 0;
-                        streamData["path"].AsString = string.Empty;
-                    }
+                byte[] rgba32 = SwapRedAndBlue(bgra32);
 
-                    info.SetNewData(baseField); // re-serializes just this object
-                    convertedCount++;
-                }
+                // --- 3. Patch fields back via the type tree (no offset math) -----------
+                baseField["m_TextureFormat"].AsInt = kFmtRGBA32;
+                baseField["m_MipCount"].AsInt = 1;
+                baseField["m_CompleteImageSize"].AsInt = rgba32.Length;
 
-                // Write the modified SerializedFile back into the bundle's directory entry
-                using var afStream = new MemoryStream();
-                af.Write(new AssetsFileWriter(afStream));
-                ReplaceBundleEntry(bundle, dirIndex, afStream.ToArray());
+                // Move the pixel data inline and clear the streaming reference. This is the
+                // key simplification vs. the earlier draft: instead of patching the bundle's
+                // .resS blob in place (fragile, and not actually supported by a public API),
+                // the now-uncompressed RGBA32 data just lives in the object itself. The bundle
+                // grows a bit, but Limbus's mod-swap textures are small enough that this is a
+                // non-issue in practice.
+                AssetTypeValueField streamData = baseField["m_StreamData"];
+                streamData["offset"].AsULong = 0;
+                streamData["size"].AsInt = 0;
+                streamData["path"].AsString = string.Empty;
+                baseField["image data"].AsByteArray = rgba32;
+
+                info.SetNewData(baseField); // re-serializes just this object
+                convertedCount++;
+                fileTouched = true;
+            }
+
+            // --- 4. Write the modified SerializedFile back into the bundle directory ---
+            if (fileTouched)
+            {
+                dirInfo.SetNewData(af);
+                touchedFiles++;
             }
         }
 
         using (var outStream = File.Create(outputPath))
+        using (var writer = new AssetsFileWriter(outStream))
         {
-            bundle.Write(new AssetsFileWriter(outStream));
+            // Writes uncompressed. If you want the original LZ4 compression back (smaller
+            // file, slightly slower to load), re-pack afterward:
+            //   var repacked = new AssetBundleFile();
+            //   using var reread = File.OpenRead(outputPath);
+            //   repacked.Read(new AssetsFileReader(reread));
+            //   using var compStream = File.Create(outputPath + ".lz4");
+            //   repacked.Pack(new AssetsFileWriter(compStream), AssetBundleCompressionType.LZ4);
+            bundle.Write(writer);
         }
 
-        Console.WriteLine($"Converted {convertedCount}/{totalTextures} textures. Wrote {outputPath}.");
+        Console.WriteLine(
+            $"Converted {convertedCount}/{totalTextures} textures across {touchedFiles} " +
+            $"serialized file(s). Wrote {outputPath}.");
         return 0;
     }
 
@@ -163,61 +195,21 @@ internal static class Program
             $"texture format {format} has no conversion rule; failing closed rather than guessing")
     };
 
-    private static byte[] DecodeToRGBA32(byte[] src, int w, int h, int format)
+    // AssetsTools.NET.Texture decodes to BGRA32; Unity's RGBA32 wants R and B swapped back.
+    private static byte[] SwapRedAndBlue(byte[] bgra)
     {
-        return format switch
+        var rgba = new byte[bgra.Length];
+        for (int i = 0; i < bgra.Length; i += 4)
         {
-            kFmtRGB24 => TextureDecoder.DecodeRGB24(src, w, h),
-            kFmtDXT1 => TextureDecoder.DecodeDXT1(src, w, h),
-            kFmtDXT5 => TextureDecoder.DecodeDXT5(src, w, h),
-            kFmtDXT5Crunched => TextureDecoder.DecodeDXT5(
-                TextureDecoder.UnpackCrunch(src, w, h), w, h),
-            _ => throw new NotSupportedException($"no decoder registered for format {format}")
-        };
+            rgba[i + 0] = bgra[i + 2]; // R <- B
+            rgba[i + 1] = bgra[i + 1]; // G
+            rgba[i + 2] = bgra[i + 0]; // B <- R
+            rgba[i + 3] = bgra[i + 3]; // A
+        }
+        return rgba;
     }
 
-    // --- bundle-level helpers -------------------------------------------------
-    // These are the pieces you already have working equivalents of in
-    // UnityBundleCAB.h/.m — shown here as the AssetsTools.NET-side counterparts
-    // so the two ends of the pipeline agree on the .resS layout.
-
-    private static bool LooksLikeSerializedFile(AssetBundleFile bundle, int dirIndex) =>
-        !bundle.BlockAndDirInfo.DirectoryInfos[dirIndex].Name.Contains(".resource");
-
-    private static byte[] ReadFromResS(AssetBundleFile bundle, string resSName, long offset, int size)
-    {
-        int idx = FindDirIndex(bundle, resSName);
-        byte[] blob = bundle.DataReader.ReadBytes((int)bundle.BlockAndDirInfo.DirectoryInfos[idx].Offset,
-                                                    (int)bundle.BlockAndDirInfo.DirectoryInfos[idx].Size);
-        var result = new byte[size];
-        Buffer.BlockCopy(blob, (int)offset, result, 0, size);
-        return result;
-    }
-
-    private static long AppendToResS(AssetBundleFile bundle, string resSName, byte[] data)
-    {
-        int idx = FindDirIndex(bundle, resSName);
-        var entry = bundle.BlockAndDirInfo.DirectoryInfos[idx];
-        long newOffset = entry.Size; // append at current end
-        bundle.AppendToNode(idx, data); // conceptual — mirrors your disk-backed .resS append
-        entry.Size += data.Length;
-        return newOffset;
-    }
-
-    private static void ReplaceBundleEntry(AssetBundleFile bundle, int dirIndex, byte[] newData) =>
-        bundle.ReplaceNode(dirIndex, newData); // conceptual — see UnityBundleCAB writer notes
-
-    private static int FindDirIndex(AssetBundleFile bundle, string name)
-    {
-        for (int i = 0; i < bundle.BlockAndDirInfo.DirectoryInfos.Count; i++)
-            if (bundle.BlockAndDirInfo.DirectoryInfos[i].Name == name)
-                return i;
-        throw new FileNotFoundException($".resS node '{name}' not found in bundle");
-    }
-}
-
-/// <summary>Placeholder disposable — swap for real pooling if the decoder needs it.</summary>
-internal sealed class AutoreleaseScope : IDisposable
-{
-    public void Dispose() { }
+    private static bool LooksLikeSerializedFile(string name) =>
+        !name.EndsWith(".resS", StringComparison.OrdinalIgnoreCase) &&
+        !name.EndsWith(".resource", StringComparison.OrdinalIgnoreCase);
 }
