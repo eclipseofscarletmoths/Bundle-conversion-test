@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BundleDoctor</AssemblyName>
+    <RootNamespace>BundleDoctor</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Schema-driven asset/bundle reading & writing -->
+    <PackageReference Include="AssetsTools.NET" Version="3.0.0" />
+
+    <!-- DXT1/DXT5/Crunch -> RGBA32 decode. Swap for whichever decoder you
+         actually end up using — this package name is a placeholder; pin it
+         to the real one you pick (e.g. a Texture2DDecoder port) once you've
+         checked NuGet, since exact package/version may have moved. -->
+    <PackageReference Include="Texture2DDecoder" Version="1.0.0" />
+  </ItemGroup>
+
+</Project>
