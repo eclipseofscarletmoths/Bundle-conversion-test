@@ -152,6 +152,30 @@ internal static class Program
                 AssetTypeValueField baseField = manager.GetBaseField(afileInst, info);
 
                 int format = baseField["m_TextureFormat"].AsInt;
+
+
+                // Skip textures that are already in the requested output format.
+
+
+                if (format == outputTextureFormat)
+
+
+                {
+
+
+                    Console.WriteLine(
+
+
+                        $"[Texture] '{texName}': format {format} already matches " +
+
+
+                        $"requested output {FormatName(outputTextureFormat)} ({outputTextureFormat}); skipping");
+
+
+                    continue;
+
+
+                }
                 if (!NeedsConversion(format))
                 {
                     // Formats 48 (ASTC RGBA 4x4) and 50 (ASTC RGBA 6x6) are already
