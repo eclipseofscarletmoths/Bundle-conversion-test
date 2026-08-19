@@ -14,12 +14,19 @@
     <!-- Schema-driven asset/bundle reading & writing -->
     <PackageReference Include="AssetsTools.NET" Version="3.0.2" />
 
-    <!-- TextureFile helper: decodes DXT1/DXT5/DXT5Crunched/RGB24/BC7/ETC1/ETC2 to BGRA32
-         in managed code. No native dependency, so it builds fine on the ubuntu-latest
-         GitHub Actions runner. Replaces the placeholder Kyaru.Texture2DDecoder reference
-         from the earlier draft, which isn't needed once AssetsTools.NET's own decoder is
-         used via TextureFile.ReadTextureFile / GetTextureData. -->
+    <!-- Used only to resolve inline vs. .resS Texture2D image data. The actual compressed
+         texture decoding is delegated to the Unity-specific Kyaru decoder below. -->
     <PackageReference Include="AssetsTools.NET.Texture" Version="3.0.2" />
+
+    <!-- Unity Texture2D decoder. The Linux native package supplies libTexture2DDecoderNative.so
+         for the ubuntu-latest runner. Kyaru's API is the same decoder used by AssetStudio and
+         exposes explicit UnityCrunch unpacking for DXT5Crunched. -->
+    <PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.1" />
+    <PackageReference Include="Kyaru.Texture2DDecoder.Linux" Version="0.2.0" />
+
+    <!-- Pure C# ASTC encoder. Converts RGBA32 source pixels into raw ASTC 6x6 blocks without
+         requiring an external astcenc executable. -->
+    <PackageReference Include="AstcSharp" Version="3.1.0" />
   </ItemGroup>
 
 </Project>

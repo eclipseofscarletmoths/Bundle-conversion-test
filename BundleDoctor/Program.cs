@@ -1,34 +1,35 @@
 // BundleDoctor/Program.cs
 //
 // Doctors a Limbus Company DESKTOP asset bundle into an iOS-loadable one.
-//   - retargets SerializedFile m_TargetPlatform 19 (StandaloneWindows64) -> 9 (iOS)
-//   - re-encodes any Texture2D whose format iOS can't sample (DXT1/DXT5/DXT5Crunched/RGB24)
-//     into RGBA32, leaving already-iOS-safe formats (RGBA32, ASTC 4x4/6x6) untouched
-//   - decoding is done by AssetsTools.NET.Texture itself (it ports detex's DXT1/DXT5/BC7/
-//     ETC1/ETC2 decoders), so no external Texture2DDecoder dependency is needed
-//   - converted textures are moved OUT of .resS and into inline "image data" so we never
-//     have to hand-roll .resS byte-offset patching inside a bundle container. That hand-rolled
-//     path (ReadFromResS/AppendToResS/AppendToNode/ReplaceNode in the previous draft) doesn't
-//     correspond to any real AssetsTools.NET API and is almost certainly why earlier attempts
-//     produced corrupted bundles -- those methods don't exist on AssetBundleFile.
+//   - retargets SerializedFile TargetPlatform -> iOS (9)
+//   - converts only these source Texture2D formats:
+//       RGB24 (3), RGBA32 (4), DXT1 (10), DXT5 (12), DXT5Crunched (29)
+//   - leaves ASTC RGBA 4x4 (48) and ASTC RGBA 6x6 (50) untouched
+//   - decodes DXT/DXT5Crunched using Kyaru.Texture2DDecoder (the Unity Texture2D
+//     decoder used by AssetStudio), with explicit UnityCrunch unpacking for format 29
+//   - re-encodes every converted texture to ASTC RGBA 6x6 (format 50) using AstcSharp
+//     so RGBA32 does not bloat the resulting bundle
+//   - moves converted texture data inline and clears m_StreamData so the rewritten
+//     Texture2D does not depend on hand-written .resS offsets
+//   - materializes AssetsTools.NET replacers with Write(), then reloads and repacks
+//     the materialized bundle as LZ4HC
 //
-// Deps (NuGet):
-//   AssetsTools.NET          - core read/write, replacers
-//   AssetsTools.NET.Texture  - TextureFile helper (decode DXT1/DXT5/DXT5Crunched/RGB24/etc.)
+// NuGet:
+//   AssetsTools.NET 3.0.2
+//   AssetsTools.NET.Texture 3.0.2 (raw Texture2D data access only)
+//   Kyaru.Texture2DDecoder 0.17.1 + Kyaru.Texture2DDecoder.Linux 0.2.0
+//   AstcSharp 3.1.0
 //
 // Usage: BundleDoctor <input.bundle> <output.bundle> [classdata.tpk]
 //
-// The classdata.tpk arg is optional. AssetBundles built by Unity normally embed their own
-// type trees, so GetBaseField usually works without one. If you hit a "type template not
-// found" / mono type exception, download a matching tpk from the AssetRipper/Tpk repo, check
-// it into the repo, and pass its path as the 3rd arg -- LoadClassPackage + LoadClassDatabase-
-// FromPackage(af.Metadata.UnityVersion) get called automatically when it's supplied.
-
 using System;
 using System.IO;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using AssetsTools.NET.Texture;
+using AstcSharp;
+using AstcSharp.Core;
+using Texture2DDecoder;
 
 internal static class Program
 {
@@ -125,52 +126,99 @@ internal static class Program
 
                 int format = baseField["m_TextureFormat"].AsInt;
                 if (!NeedsConversion(format))
-                    continue; // already RGBA32/ASTC -- leave completely untouched
+                {
+                    // Formats 48 (ASTC RGBA 4x4) and 50 (ASTC RGBA 6x6) are already
+                    // supported by the target iOS build, so leave them byte-for-byte alone.
+                    continue;
+                }
 
                 int width = baseField["m_Width"].AsInt;
                 int height = baseField["m_Height"].AsInt;
                 string texName = baseField["m_Name"].AsString;
 
-                // AssetsTools.NET.Texture's current API separates reading the encoded bytes
-                // from decoding them. The older GetTextureData(AssetsFileInstance) helper used
-                // by some wiki examples is not present in the package used by this project.
-                // FillPictureData resolves inline data or a streamed .resS entry, then the
-                // managed decoder converts the encoded texture into BGRA32.
-                TextureFile tf = TextureFile.ReadTextureFile(baseField);
+                if (width <= 0 || height <= 0)
+                    throw new InvalidDataException($"invalid dimensions for '{texName}': {width}x{height}");
 
+                // AssetsTools.NET.Texture is retained only for reliably resolving inline
+                // image data vs. streamed .resS data. The actual compressed-texture decoder
+                // is Kyaru.Texture2DDecoder, which is the same Unity Texture2D decoder used
+                // by AssetStudio and has explicit UnityCrunch handling.
+                TextureFile tf = TextureFile.ReadTextureFile(baseField);
                 byte[] encodedData = tf.FillPictureData(afileInst)
                     ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
 
-                byte[] bgra32 = TextureFile.DecodeManagedData(
-                    encodedData,
-                    (TextureFormat)format,
-                    width,
-                    height,
-                    useBgra: true)
-                    ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
+                byte[] rgba32;
+                switch (format)
+                {
+                    case kFmtRGB24:
+                        rgba32 = DecodeRGB24(encodedData, width, height);
+                        break;
 
-                if (bgra32.Length != width * height * 4)
+                    case kFmtRGBA32:
+                        int expectedRgbaBytes = checked(width * height * 4);
+                        if (encodedData.Length < expectedRgbaBytes)
+                        {
+                            throw new InvalidDataException(
+                                $"RGBA32 data too small for '{texName}': got {encodedData.Length}, " +
+                                $"expected at least {expectedRgbaBytes}");
+                        }
+
+                        // Unity TextureFormat.RGBA32 is already RGBA byte order.
+                        rgba32 = new byte[expectedRgbaBytes];
+                        Buffer.BlockCopy(encodedData, 0, rgba32, 0, expectedRgbaBytes);
+                        break;
+
+                    case kFmtDXT1:
+                        rgba32 = DecodeKyaruDXT(encodedData, width, height, isDxt5: false);
+                        break;
+
+                    case kFmtDXT5:
+                        rgba32 = DecodeKyaruDXT(encodedData, width, height, isDxt5: true);
+                        break;
+
+                    case kFmtDXT5Crunched:
+                        rgba32 = DecodeKyaruDXT5Crunched(encodedData, width, height);
+                        break;
+
+                    default:
+                        throw new InvalidOperationException(
+                            $"conversion dispatch missing for texture format {format} ('{texName}')");
+                }
+
+                int expectedDecodedSize = checked(width * height * 4);
+                if (rgba32.Length != expectedDecodedSize)
+                {
                     throw new InvalidDataException(
-                        $"decoded size mismatch for '{texName}': got {bgra32.Length}, " +
-                        $"expected {width * height * 4}");
+                        $"decoded RGBA size mismatch for '{texName}' (format {format}): " +
+                        $"got {rgba32.Length}, expected {expectedDecodedSize}");
+                }
 
-                byte[] rgba32 = SwapRedAndBlue(bgra32);
+                // Always target ASTC RGBA 6x6 for converted textures. Compared with RGBA32,
+                // ASTC 6x6 is dramatically smaller while remaining natively supported on the
+                // target iOS texture pipeline.
+                byte[] astcBlocks = EncodeAstc6x6(rgba32, width, height);
+                int expectedAstcSize = checked(((width + 5) / 6) * ((height + 5) / 6) * 16);
+                if (astcBlocks.Length != expectedAstcSize)
+                {
+                    throw new InvalidDataException(
+                        $"ASTC 6x6 size mismatch for '{texName}' (format {format}): " +
+                        $"got {astcBlocks.Length}, expected {expectedAstcSize}");
+                }
 
-                // --- 3. Write RGBA32 back into the Texture2D --------------------------
-                // AssetsTools.NET.Texture 3.0.2 exposes the decoding helpers we use above,
-                // but does not expose the newer 5-argument SetPictureData overload. Keep the
-                // write-back entirely type-tree based instead. This is also preferable here
-                // because it lets us explicitly move the pixels inline and clear any .resS
-                // streaming reference.
-                baseField["m_TextureFormat"].AsInt = kFmtRGBA32;
+                Console.WriteLine(
+                    $"[Texture] '{texName}' {width}x{height}: format {format} -> 50 " +
+                    $"(ASTC RGBA 6x6), {encodedData.Length:N0} -> {astcBlocks.Length:N0} bytes");
+
+                // --- 3. Write ASTC 6x6 back into the Texture2D ------------------------
+                baseField["m_TextureFormat"].AsInt = kFmtASTC_RGBA_6x6;
                 baseField["m_MipCount"].AsInt = 1;
-                baseField["m_CompleteImageSize"].AsInt = rgba32.Length;
+                baseField["m_CompleteImageSize"].AsInt = astcBlocks.Length;
 
                 AssetTypeValueField streamData = baseField["m_StreamData"];
                 streamData["offset"].AsULong = 0;
                 streamData["size"].AsInt = 0;
                 streamData["path"].AsString = string.Empty;
-                baseField["image data"].AsByteArray = rgba32;
+                baseField["image data"].AsByteArray = astcBlocks;
 
                 info.SetNewData(baseField); // re-serializes just this object
                 convertedCount++;
@@ -244,6 +292,8 @@ internal static class Program
         {
             BundleFileInstance verifyBundle = verifyManager.LoadBundleFile(outputPath, unpackIfPacked: true);
             int verifiedSerializedFiles = 0;
+            int verifiedTextures = 0;
+            int remainingDesktopTextureFormats = 0;
 
             for (int i = 0; i < verifyBundle.file.BlockAndDirInfo.DirectoryInfos.Count; i++)
             {
@@ -267,6 +317,15 @@ internal static class Program
                             $"ERROR: {verifyDir.Name} still targets platform {target}; expected {kTargetIOS}.");
                         return 1;
                     }
+
+                    foreach (AssetFileInfo verifyInfo in verifyFile.file.GetAssetsOfType(AssetClassID.Texture2D))
+                    {
+                        verifiedTextures++;
+                        AssetTypeValueField verifyBase = verifyManager.GetBaseField(verifyFile, verifyInfo);
+                        int verifyFormat = verifyBase["m_TextureFormat"].AsInt;
+                        if (NeedsConversion(verifyFormat))
+                            remainingDesktopTextureFormats++;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -281,6 +340,18 @@ internal static class Program
                 Console.Error.WriteLine("ERROR: output bundle contains no verifiable SerializedFiles.");
                 return 1;
             }
+
+            if (remainingDesktopTextureFormats != 0)
+            {
+                Console.Error.WriteLine(
+                    $"ERROR: output still contains {remainingDesktopTextureFormats} texture(s) " +
+                    "using a format that this doctor is supposed to convert.");
+                return 1;
+            }
+
+            Console.WriteLine(
+                $"[verify] SerializedFiles={verifiedSerializedFiles}, Texture2D={verifiedTextures}, " +
+                "all converted-source formats removed.");
         }
         finally
         {
@@ -295,27 +366,96 @@ internal static class Program
 
     private static bool NeedsConversion(int format) => format switch
     {
+        // Desktop-only / unsupported formats: decode then re-encode to ASTC 6x6.
         kFmtRGB24 => true,
         kFmtDXT1 => true,
         kFmtDXT5 => true,
         kFmtDXT5Crunched => true,
-        kFmtRGBA32 => false,
+
+        // RGBA32 is supported, but intentionally converted because its raw storage size
+        // makes bundles unnecessarily large.
+        kFmtRGBA32 => true,
+
+        // Already supported target formats: leave untouched.
         kFmtASTC_RGBA_4x4 => false,
         kFmtASTC_RGBA_6x6 => false,
+
         _ => throw new NotSupportedException(
             $"texture format {format} has no conversion rule; failing closed rather than guessing")
     };
 
-    // AssetsTools.NET.Texture decodes to BGRA32; Unity's RGBA32 wants R and B swapped back.
-    private static byte[] SwapRedAndBlue(byte[] bgra)
+    private static byte[] DecodeRGB24(byte[] data, int width, int height)
+    {
+        int pixelCount = checked(width * height);
+        int expected = checked(pixelCount * 3);
+        if (data.Length < expected)
+            throw new InvalidDataException(
+                $"RGB24 data too small: got {data.Length}, expected at least {expected}");
+
+        var rgba = new byte[pixelCount * 4];
+        for (int i = 0, src = 0, dst = 0; i < pixelCount; i++, src += 3, dst += 4)
+        {
+            rgba[dst + 0] = data[src + 0]; // R
+            rgba[dst + 1] = data[src + 1]; // G
+            rgba[dst + 2] = data[src + 2]; // B
+            rgba[dst + 3] = 255;           // A
+        }
+        return rgba;
+    }
+
+    private static byte[] DecodeKyaruDXT(byte[] encodedData, int width, int height, bool isDxt5)
+    {
+        int outputSize = checked(width * height * 4);
+        var bgra = new byte[outputSize];
+
+        bool ok = isDxt5
+            ? TextureDecoder.DecodeDXT5(encodedData, width, height, bgra)
+            : TextureDecoder.DecodeDXT1(encodedData, width, height, bgra);
+
+        if (!ok)
+        {
+            throw new InvalidDataException(
+                $"Kyaru Texture2DDecoder failed to decode {(isDxt5 ? "DXT5" : "DXT1")}");
+        }
+
+        return BgraToRgba(bgra);
+    }
+
+    private static byte[] DecodeKyaruDXT5Crunched(byte[] encodedData, int width, int height)
+    {
+        // Limbus Company is a modern Unity build (Unity 6), so use UnityCrunch explicitly.
+        // This avoids relying on the serialized Unity-version metadata, which may be obfuscated.
+        byte[]? unpacked = TextureDecoder.UnpackUnityCrunch(encodedData);
+        if (unpacked == null || unpacked.Length == 0)
+            throw new InvalidDataException("Kyaru Texture2DDecoder failed to unpack UnityCrunch DXT5 data");
+
+        int outputSize = checked(width * height * 4);
+        var bgra = new byte[outputSize];
+        if (!TextureDecoder.DecodeDXT5(unpacked, width, height, bgra))
+            throw new InvalidDataException("Kyaru Texture2DDecoder failed to decode unpacked UnityCrunch DXT5 data");
+
+        return BgraToRgba(bgra);
+    }
+
+    private static byte[] EncodeAstc6x6(byte[] rgba32, int width, int height)
+    {
+        using var source = new MemoryStream(rgba32, writable: false);
+        using var destination = new MemoryStream();
+
+        var footprint = Footprint.FromFootprintType(FootprintType.Footprint6x6);
+        AstcEncoder.CompressImage(source, destination, width, height, footprint);
+        return destination.ToArray();
+    }
+
+    private static byte[] BgraToRgba(byte[] bgra)
     {
         var rgba = new byte[bgra.Length];
         for (int i = 0; i < bgra.Length; i += 4)
         {
             rgba[i + 0] = bgra[i + 2]; // R <- B
-            rgba[i + 1] = bgra[i + 1]; // G
+            rgba[i + 1] = bgra[i + 1]; // G <- G
             rgba[i + 2] = bgra[i + 0]; // B <- R
-            rgba[i + 3] = bgra[i + 3]; // A
+            rgba[i + 3] = bgra[i + 3]; // A <- A
         }
         return rgba;
     }
