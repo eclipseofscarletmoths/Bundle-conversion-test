@@ -19,7 +19,7 @@
          GitHub Actions runner. Replaces the placeholder Kyaru.Texture2DDecoder reference
          from the earlier draft, which isn't needed once AssetsTools.NET's own decoder is
          used via TextureFile.ReadTextureFile / GetTextureData. -->
-    <PackageReference Include="AssetsTools.NET.Texture" Version="3.0.5" />
+    <PackageReference Include="AssetsTools.NET.Texture" Version="3.0.2" />
   </ItemGroup>
 
 </Project>
