@@ -18,7 +18,7 @@
          actually end up using — this package name is a placeholder; pin it
          to the real one you pick (e.g. a Texture2DDecoder port) once you've
          checked NuGet, since exact package/version may have moved. -->
-    <PackageReference Include="Texture2DDecoder" Version="0.17.1" />
+    <PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.1" />
   </ItemGroup>
 
 </Project>
