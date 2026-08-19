@@ -127,17 +127,15 @@ internal static class Program
                 TextureFile tf = TextureFile.ReadTextureFile(baseField);
 
                 byte[] encodedData = tf.FillPictureData(afileInst)
-                 ?? throw new InvalidDataException(
-                  $"could not load texture data for '{texName}'");
+                    ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
 
                 byte[] bgra32 = TextureFile.DecodeManagedData(
-                 encodedData,
-                 (TextureFormat)format,
-                 width,
-                 height,
-                 useBgra: true)
-                 ?? throw new InvalidDataException(
-                 $"could not decode texture data for '{texName}'");
+                    encodedData,
+                    (TextureFormat)format,
+                    width,
+                    height,
+                    useBgra: true)
+                    ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
 
                 if (bgra32.Length != width * height * 4)
                     throw new InvalidDataException(
@@ -146,18 +144,22 @@ internal static class Program
 
                 byte[] rgba32 = SwapRedAndBlue(bgra32);
 
-                // --- 3. Rebuild the TextureFile consistently ---------------------------
-                // RGBA32 is stored inline, so there is no .resS offset to patch manually.
-                // SetPictureData also updates m_TextureFormat, m_CompleteImageSize,
-                // m_StreamData, m_MipCount, and m_MipMap as a coherent group.
-                tf.SetPictureData(
-                    rgba32,
-                    width,
-                    height,
-                    (TextureFormat)kFmtRGBA32,
-                    mipCount: 1);
+                // --- 3. Write RGBA32 back into the Texture2D --------------------------
+                // AssetsTools.NET.Texture 3.0.2 exposes the decoding helpers we use above,
+                // but does not expose the newer 5-argument SetPictureData overload. Keep the
+                // write-back entirely type-tree based instead. This is also preferable here
+                // because it lets us explicitly move the pixels inline and clear any .resS
+                // streaming reference.
+                baseField["m_TextureFormat"].AsInt = kFmtRGBA32;
+                baseField["m_MipCount"].AsInt = 1;
+                baseField["m_CompleteImageSize"].AsInt = rgba32.Length;
 
-                tf.WriteTo(baseField);
+                AssetTypeValueField streamData = baseField["m_StreamData"];
+                streamData["offset"].AsULong = 0;
+                streamData["size"].AsInt = 0;
+                streamData["path"].AsString = string.Empty;
+                baseField["image data"].AsByteArray = rgba32;
+
                 info.SetNewData(baseField); // re-serializes just this object
                 convertedCount++;
                 fileTouched = true;
