@@ -61,7 +61,6 @@ int etc2_encode_rgba8(
         &extendedHeight,
         &encodingTimeMs);
 
-        (void)status;
         if (!encoded || encodedLength == 0) {
             delete[] encoded;
             return 2;
