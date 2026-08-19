@@ -8,6 +8,18 @@ on:
         required: true
         type: string
 
+      output_format:
+        description: "Texture output format"
+        required: false
+        default: "RGBA32"
+        type: choice
+        options:
+          - RGBA32
+          - ETC2_RGB
+          - ETC2_RGBA8
+          - ASTC_RGBA_4x4
+          - ASTC_RGBA_6x6
+
 # Least-privilege: this token can only touch this repo's releases/contents,
 # not your account broadly. Still, treat the PAT the tweak uses to trigger
 # this workflow as sensitive — see BundleDoctorService.m notes.
@@ -25,20 +37,8 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Build native ETC2 encoder
-        run: |
-          git clone --depth 1 https://github.com/google/etc2comp.git third_party/etc2comp
-          cmake -S BundleDoctor/native -B native-build \
-            -DETC2COMP_SOURCE_DIR="$PWD/third_party/etc2comp" \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build native-build --config Release --parallel
-          cp native-build/libbundle_doctor_etc2.so .
-
       - name: Restore & build converter
         run: dotnet build BundleDoctor/BundleDoctor.csproj -c Release -o build
-        
-      - name: Copy native ETC2 encoder beside converter
-        run: cp libbundle_doctor_etc2.so build/
 
       - name: Fetch input.bundle from the queue release
         env:
@@ -50,7 +50,11 @@ jobs:
             --output input.bundle
 
       - name: Run BundleDoctor
-        run: dotnet build/BundleDoctor.dll input.bundle output.bundle
+        env:
+          OUTPUT_FORMAT: ${{ inputs.output_format }}
+        run: |
+          FORMAT="${OUTPUT_FORMAT:-RGBA32}"
+          dotnet build/BundleDoctor.dll input.bundle output.bundle "$FORMAT"
 
       - name: Upload output.bundle back onto the same release
         env:

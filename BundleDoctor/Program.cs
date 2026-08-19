@@ -7,10 +7,8 @@
 //   - leaves ASTC RGBA 4x4 (48) and ASTC RGBA 6x6 (50) untouched
 //   - decodes DXT/DXT5Crunched using Kyaru.Texture2DDecoder (the Unity Texture2D
 //     decoder used by AssetStudio), with explicit UnityCrunch unpacking for format 29
-//   - re-encodes converted textures to ETC2:
-//       opaque textures -> ETC2 RGB4 (format 45, 4 bpp)
-//       textures with alpha -> ETC2 RGBA8 (format 47, 8 bpp)
-//     using Google's fast Etc2Comp encoder through a tiny native C ABI wrapper
+//   - re-encodes every converted texture to a configurable output format
+//     (default: RGBA32); ASTC 4x4/6x6 use AstcSharp and ETC2 uses the optional native encoder
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - materializes AssetsTools.NET replacers with Write(), then reloads and repacks
@@ -20,15 +18,17 @@
 //   AssetsTools.NET 3.0.2
 //   AssetsTools.NET.Texture 3.0.2 (raw Texture2D data access only)
 //   Kyaru.Texture2DDecoder 0.17.1 + Kyaru.Texture2DDecoder.Linux 0.2.0
-//   Native Google Etc2Comp (built by .github/workflows/doctor-bundle.yml)
+//   AstcSharp 3.1.0
 //
-// Usage: BundleDoctor <input.bundle> <output.bundle> [classdata.tpk]
+// Usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]
 //
 using System;
 using System.IO;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using AssetsTools.NET.Texture;
+using AstcSharp;
+using AstcSharp.Core;
 using Texture2DDecoder;
 
 internal static class Program
@@ -48,17 +48,42 @@ internal static class Program
     private const int kFmtASTC_RGBA_4x4 = 48;
     private const int kFmtASTC_RGBA_6x6 = 50;
 
+    // Default output format. The workflow can override this with the final CLI argument.
+    // Accepted names: RGBA32, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6.
+    private const int kDefaultOutputTextureFormat = kFmtRGBA32;
+
     private static int Main(string[] args)
     {
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("usage: BundleDoctor <input.bundle> <output.bundle> [classdata.tpk]");
+            Console.Error.WriteLine("usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]");
             return 2;
         }
 
         string inputPath = args[0];
         string outputPath = args[1];
-        string? tpkPath = args.Length > 2 ? args[2] : null;
+
+        string? tpkPath = null;
+        string outputFormatName = "RGBA32";
+
+        if (args.Length >= 3)
+        {
+            // If the third argument is a recognized format, treat it as the output format.
+            // Otherwise retain the legacy third-argument classdata.tpk position.
+            if (IsOutputTextureFormatName(args[2]))
+                outputFormatName = args[2];
+            else
+                tpkPath = args[2];
+        }
+
+        if (args.Length >= 4)
+            outputFormatName = args[3];
+
+        int outputTextureFormat =
+            ParseOutputTextureFormat(outputFormatName, kDefaultOutputTextureFormat);
+
+        Console.WriteLine(
+            $"[config] OutputTextureFormat={FormatName(outputTextureFormat)} ({outputTextureFormat})");
 
         var manager = new AssetsManager();
         if (tpkPath != null)
@@ -195,38 +220,29 @@ internal static class Program
                         $"got {rgba32.Length}, expected {expectedDecodedSize}");
                 }
 
-                // ETC2 is fixed 4x4-block compression. Use the 4 bpp RGB form when
-                // every source pixel is opaque, and the 8 bpp RGBA form when alpha is
-                // actually present. This is substantially cheaper to encode than ASTC
-                // while keeping converted textures far smaller than RGBA32.
-                bool hasAlpha = HasNonOpaquePixels(rgba32);
-                int outputFormat = hasAlpha ? kFmtETC2_RGBA8 : kFmtETC2_RGB;
-                float effort = 0.0f; // Etc2Comp fast/default pass
-                int jobs = Math.Max(1, Environment.ProcessorCount);
-                byte[] etc2Blocks = NativeEtc2.Encode(rgba32, width, height, hasAlpha, effort, jobs);
-                int bytesPerBlock = hasAlpha ? 16 : 8;
-                int expectedEtc2Size = checked(((width + 3) / 4) * ((height + 3) / 4) * bytesPerBlock);
-                if (etc2Blocks.Length != expectedEtc2Size)
-                {
-                    throw new InvalidDataException(
-                        $"ETC2 size mismatch for '{texName}' (format {format} -> {outputFormat}): " +
-                        $"got {etc2Blocks.Length:N0}, expected {expectedEtc2Size}");
-                }
+                // Encode the decoded RGBA32 pixels according to the selected output format.
+                byte[] outputData = EncodeOutputTexture(
+                    rgba32,
+                    width,
+                    height,
+                    outputTextureFormat,
+                    texName);
 
                 Console.WriteLine(
-                    $"[Texture] '{texName}' {width}x{height}: format {format} -> {outputFormat} " +
-                    $"({(hasAlpha ? "ETC2 RGBA8" : "ETC2 RGB4")}), " +
-                    $"{encodedData.Length:N0} -> {etc2Blocks.Length:N0} bytes");
+                    $"[Texture] '{texName}' {width}x{height}: format {format} -> " +
+                    $"{FormatName(outputTextureFormat)} ({outputTextureFormat}), " +
+                    $"{encodedData.Length:N0} -> {outputData.Length:N0} bytes");
 
-                // --- 3. Write ETC2 data back into the Texture2D -----------------------
-                baseField["m_TextureFormat"].AsInt = outputFormat;
+                // --- 3. Write the selected format back into the Texture2D -------------
+                baseField["m_TextureFormat"].AsInt = outputTextureFormat;
                 baseField["m_MipCount"].AsInt = 1;
-                baseField["m_CompleteImageSize"].AsInt = etc2Blocks.Length;
+                baseField["m_CompleteImageSize"].AsInt = outputData.Length;
+
                 AssetTypeValueField streamData = baseField["m_StreamData"];
                 streamData["offset"].AsULong = 0;
                 streamData["size"].AsInt = 0;
                 streamData["path"].AsString = string.Empty;
-                baseField["image data"].AsByteArray = etc2Blocks;
+                baseField["image data"].AsByteArray = outputData;
 
                 info.SetNewData(baseField); // re-serializes just this object
                 convertedCount++;
@@ -374,23 +390,152 @@ internal static class Program
 
     private static bool NeedsConversion(int format) => format switch
     {
-        // Desktop-only / unsupported formats: decode then re-encode to ETC2.
+        // Desktop-only / unsupported formats: decode then re-encode.
         kFmtRGB24 => true,
+        kFmtRGBA32 => true,
         kFmtDXT1 => true,
         kFmtDXT5 => true,
         kFmtDXT5Crunched => true,
 
-        // RGBA32 is supported, but intentionally converted because its raw storage size
-        // makes bundles unnecessarily large.
-        kFmtRGBA32 => true,
-
-        // Already supported target formats: leave untouched.
+        // Already-supported / already-converted formats: leave untouched.
+        kFmtETC2_RGB => false,
+        kFmtETC2_RGBA8 => false,
         kFmtASTC_RGBA_4x4 => false,
         kFmtASTC_RGBA_6x6 => false,
 
         _ => throw new NotSupportedException(
             $"texture format {format} has no conversion rule; failing closed rather than guessing")
     };
+
+    private static bool IsOutputTextureFormatName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "RGBA32" => true,
+            "ETC2_RGB" => true,
+            "ETC2_RGBA8" => true,
+            "ASTC_RGBA_4X4" => true,
+            "ASTC_RGBA_6X6" => true,
+            "3" => true,
+            "4" => true,
+            "45" => true,
+            "47" => true,
+            "48" => true,
+            "50" => true,
+            _ => false
+        };
+    }
+
+    private static int ParseOutputTextureFormat(string value, int defaultFormat)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return defaultFormat;
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "RGBA32" => kFmtRGBA32,
+            "ETC2_RGB" => kFmtETC2_RGB,
+            "ETC2_RGBA8" => kFmtETC2_RGBA8,
+            "ASTC_RGBA_4X4" => kFmtASTC_RGBA_4x4,
+            "ASTC_RGBA_6X6" => kFmtASTC_RGBA_6x6,
+            "3" => kFmtRGB24,
+            "4" => kFmtRGBA32,
+            "45" => kFmtETC2_RGB,
+            "47" => kFmtETC2_RGBA8,
+            "48" => kFmtASTC_RGBA_4x4,
+            "50" => kFmtASTC_RGBA_6x6,
+            _ => throw new ArgumentException(
+                $"Unknown output texture format '{value}'. " +
+                "Use RGBA32, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, or ASTC_RGBA_6x6.")
+        };
+    }
+
+    private static string FormatName(int format) => format switch
+    {
+        kFmtRGBA32 => "RGBA32",
+        kFmtETC2_RGB => "ETC2_RGB",
+        kFmtETC2_RGBA8 => "ETC2_RGBA8",
+        kFmtASTC_RGBA_4x4 => "ASTC_RGBA_4x4",
+        kFmtASTC_RGBA_6x6 => "ASTC_RGBA_6x6",
+        _ => $"Format{format}"
+    };
+
+    private static byte[] EncodeOutputTexture(
+        byte[] rgba32,
+        int width,
+        int height,
+        int outputFormat,
+        string texName)
+    {
+        switch (outputFormat)
+        {
+            case kFmtRGBA32:
+                // No compression: directly store Unity RGBA32 pixels.
+                return rgba32;
+
+            case kFmtASTC_RGBA_4x4:
+                return EncodeAstc(
+                    rgba32,
+                    width,
+                    height,
+                    FootprintType.Footprint4x4,
+                    outputFormat,
+                    texName);
+
+            case kFmtASTC_RGBA_6x6:
+                return EncodeAstc(
+                    rgba32,
+                    width,
+                    height,
+                    FootprintType.Footprint6x6,
+                    outputFormat,
+                    texName);
+
+            case kFmtETC2_RGB:
+            case kFmtETC2_RGBA8:
+                throw new NotSupportedException(
+                    $"ETC2 output ({FormatName(outputFormat)}) is not available in this Kyaru-based " +
+                    "build. Remove this case or add the native ETC2 encoder before selecting it.");
+
+            default:
+                throw new NotSupportedException(
+                    $"Output texture format {outputFormat} is not implemented.");
+        }
+    }
+
+    private static byte[] EncodeAstc(
+        byte[] rgba32,
+        int width,
+        int height,
+        FootprintType footprintType,
+        int outputFormat,
+        string texName)
+    {
+        using var source = new MemoryStream(rgba32, writable: false);
+        using var destination = new MemoryStream();
+
+        var footprint = Footprint.FromFootprintType(footprintType);
+        AstcEncoder.CompressImage(source, destination, width, height, footprint);
+        byte[] blocks = destination.ToArray();
+
+        int blockWidth = footprintType == FootprintType.Footprint4x4 ? 4 : 6;
+        int expectedSize = checked(
+            ((width + blockWidth - 1) / blockWidth) *
+            ((height + blockWidth - 1) / blockWidth) *
+            16);
+
+        if (blocks.Length != expectedSize)
+        {
+            throw new InvalidDataException(
+                $"ASTC {blockWidth}x{blockWidth} size mismatch for '{texName}': " +
+                $"got {blocks.Length:N0}, expected {expectedSize:N0}");
+        }
+
+        return blocks;
+    }
 
     private static byte[] DecodeRGB24(byte[] data, int width, int height)
     {
@@ -445,15 +590,14 @@ internal static class Program
         return BgraToRgba(bgra);
     }
 
-    private static bool HasNonOpaquePixels(byte[] rgba)
+    private static byte[] EncodeAstc6x6(byte[] rgba32, int width, int height)
     {
-        for (int i = 3; i < rgba.Length; i += 4)
-        {
-            if (rgba[i] != 255)
-                return true;
-        }
+        using var source = new MemoryStream(rgba32, writable: false);
+        using var destination = new MemoryStream();
 
-        return false;
+        var footprint = Footprint.FromFootprintType(FootprintType.Footprint6x6);
+        AstcEncoder.CompressImage(source, destination, width, height, footprint);
+        return destination.ToArray();
     }
 
     private static byte[] BgraToRgba(byte[] bgra)

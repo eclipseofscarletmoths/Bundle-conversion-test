@@ -23,6 +23,10 @@
          exposes explicit UnityCrunch unpacking for DXT5Crunched. -->
     <PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.1" />
     <PackageReference Include="Kyaru.Texture2DDecoder.Linux" Version="0.2.0" />
+
+    <!-- Pure C# ASTC encoder. Converts RGBA32 source pixels into raw ASTC 6x6 blocks without
+         requiring an external astcenc executable. -->
+    <PackageReference Include="AstcSharp" Version="3.1.0" />
   </ItemGroup>
 
 </Project>
