@@ -69,6 +69,7 @@ internal static class Program
         int convertedCount = 0;
         int totalTextures = 0;
         int touchedFiles = 0;
+        int retargetedFiles = 0;
 
         for (int dirIndex = 0; dirIndex < bundle.BlockAndDirInfo.DirectoryInfos.Count; dirIndex++)
         {
@@ -99,11 +100,22 @@ internal static class Program
             bool fileTouched = false;
 
             // --- 1. Retarget platform ---------------------------------------------
-            if (af.Metadata.TargetPlatform == kTargetWindows64)
+            uint originalTargetPlatform = af.Metadata.TargetPlatform;
+            Console.WriteLine(
+                $"[{dirInfo.Name}] TargetPlatform before: {originalTargetPlatform} -> requested {kTargetIOS}");
+
+            // Do this unconditionally rather than only when the source says 19.
+            // The caller has already identified this as a SerializedFile we want to
+            // doctor, so there is no benefit in leaving a non-iOS platform value in it.
+            if (originalTargetPlatform != kTargetIOS)
             {
                 af.Metadata.TargetPlatform = kTargetIOS;
                 fileTouched = true;
+                retargetedFiles++;
             }
+
+            Console.WriteLine(
+                $"[{dirInfo.Name}] TargetPlatform after:  {af.Metadata.TargetPlatform}");
 
             // --- 2. Walk Texture2D objects ------------------------------------------
             foreach (AssetFileInfo info in af.GetAssetsOfType(AssetClassID.Texture2D))
@@ -173,22 +185,111 @@ internal static class Program
             }
         }
 
-        using (var outStream = File.Create(outputPath))
-        using (var writer = new AssetsFileWriter(outStream))
+        // IMPORTANT: AssetBundleFile.Pack() streams DataReader.BaseStream directly and
+        // does not apply DirectoryInfo.Replacer objects. That means calling Pack()
+        // immediately after SetNewData(af) silently discards BOTH the target-platform
+        // change and any Texture2D replacements.
+        //
+        // Therefore the write pipeline must be two-stage:
+        //   1. Write() -> materialize all replacers into a fresh, uncompressed bundle.
+        //   2. Reload that fresh bundle -> Pack() it as LZ4HC.
+        string tempUnpackedPath = Path.Combine(
+            Path.GetTempPath(),
+            $"BundleDoctor-{Guid.NewGuid():N}.unity3d");
+
+        try
         {
-            // Re-pack the doctored bundle using LZ4HC.
-            // In AssetsTools.NET, AssetBundleCompressionType.LZ4 uses the
-            // high-compression LZ4 path (Encode32HC) and writes Unity's
-            // LZ4HC block flags. LZ4Fast is the lower-compression variant.
-            bundle.Pack(
-                writer,
-                AssetBundleCompressionType.LZ4,
-                blockDirAtEnd: true);
+            using (var tempStream = File.Create(tempUnpackedPath))
+            using (var tempWriter = new AssetsFileWriter(tempStream))
+            {
+                bundle.Write(tempWriter, 0);
+            }
+
+            // Reload the materialized bundle so Pack() reads the doctored bytes rather
+            // than the original bundle's DataReader stream.
+            var repackManager = new AssetsManager();
+            try
+            {
+                BundleFileInstance materialized = repackManager.LoadBundleFile(
+                    tempUnpackedPath, unpackIfPacked: true);
+
+                using (var outStream = File.Create(outputPath))
+                using (var writer = new AssetsFileWriter(outStream))
+                {
+                    // AssetsTools.NET's LZ4 mode uses the Encode32HC path for the
+                    // high-compression blocks.
+                    materialized.file.Pack(
+                        writer,
+                        AssetBundleCompressionType.LZ4,
+                        blockDirAtEnd: true);
+                }
+
+                materialized.file.Close();
+            }
+            finally
+            {
+                repackManager.UnloadAll();
+            }
+        }
+        finally
+        {
+            try { File.Delete(tempUnpackedPath); } catch { }
+        }
+
+        // Final verification: reload the actual output and make sure the serialized
+        // files that can be parsed are now targeting iOS. This turns a silent no-op
+        // into a workflow failure instead of handing the tweak a Windows-targeted bundle.
+        var verifyManager = new AssetsManager();
+        try
+        {
+            BundleFileInstance verifyBundle = verifyManager.LoadBundleFile(outputPath, unpackIfPacked: true);
+            int verifiedSerializedFiles = 0;
+
+            for (int i = 0; i < verifyBundle.file.BlockAndDirInfo.DirectoryInfos.Count; i++)
+            {
+                var verifyDir = verifyBundle.file.BlockAndDirInfo.DirectoryInfos[i];
+                if (!LooksLikeSerializedFile(verifyDir.Name))
+                    continue;
+
+                try
+                {
+                    AssetsFileInstance verifyFile = verifyManager.LoadAssetsFileFromBundle(
+                        verifyBundle, i, loadDeps: false);
+
+                    uint target = verifyFile.file.Metadata.TargetPlatform;
+                    Console.WriteLine(
+                        $"[verify] {verifyDir.Name}: TargetPlatform={target}");
+
+                    verifiedSerializedFiles++;
+                    if (target != kTargetIOS)
+                    {
+                        Console.Error.WriteLine(
+                            $"ERROR: {verifyDir.Name} still targets platform {target}; expected {kTargetIOS}.");
+                        return 1;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine(
+                        $"ERROR: could not verify serialized file '{verifyDir.Name}': {ex.Message}");
+                    return 1;
+                }
+            }
+
+            if (verifiedSerializedFiles == 0)
+            {
+                Console.Error.WriteLine("ERROR: output bundle contains no verifiable SerializedFiles.");
+                return 1;
+            }
+        }
+        finally
+        {
+            verifyManager.UnloadAll();
         }
 
         Console.WriteLine(
             $"Converted {convertedCount}/{totalTextures} textures across {touchedFiles} " +
-            $"serialized file(s). Wrote {outputPath}.");
+            $"serialized file(s); retargeted {retargetedFiles} file(s). Wrote and verified {outputPath}.");
         return 0;
     }
 
