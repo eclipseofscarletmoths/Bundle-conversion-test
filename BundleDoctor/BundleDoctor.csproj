@@ -12,14 +12,14 @@
 
   <ItemGroup>
     <!-- Schema-driven asset/bundle reading & writing -->
-    <PackageReference Include="AssetsTools.NET" Version="3.0.5" />
+    <PackageReference Include="AssetsTools.NET" Version="3.0.2" />
 
     <!-- TextureFile helper: decodes DXT1/DXT5/DXT5Crunched/RGB24/BC7/ETC1/ETC2 to BGRA32
          in managed code. No native dependency, so it builds fine on the ubuntu-latest
          GitHub Actions runner. Replaces the placeholder Kyaru.Texture2DDecoder reference
          from the earlier draft, which isn't needed once AssetsTools.NET's own decoder is
          used via TextureFile.ReadTextureFile / GetTextureData. -->
-    <PackageReference Include="AssetsTools.NET.Texture" Version="3.0.5" />
+    <PackageReference Include="AssetsTools.NET.Texture" Version="3.0.2" />
   </ItemGroup>
 
 </Project>

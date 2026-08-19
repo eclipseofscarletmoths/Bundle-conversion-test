@@ -119,11 +119,22 @@ internal static class Program
                 int height = baseField["m_Height"].AsInt;
                 string texName = baseField["m_Name"].AsString;
 
-                // TextureFile.ReadTextureFile + GetTextureData resolve streamed (.resS) data
-                // automatically when the base field came from a bundle-loaded AssetsFileInstance,
-                // and fall back to inline "image data" otherwise -- no manual offset math needed.
+                // AssetsTools.NET.Texture's current API separates reading the encoded bytes
+                // from decoding them. The older GetTextureData(AssetsFileInstance) helper used
+                // by some wiki examples is not present in the package used by this project.
+                // FillPictureData resolves inline data or a streamed .resS entry, then the
+                // managed decoder converts the encoded texture into BGRA32.
                 TextureFile tf = TextureFile.ReadTextureFile(baseField);
-                byte[] bgra32 = tf.GetTextureData(afileInst)
+
+                byte[] encodedData = tf.FillPictureData(afileInst)
+                    ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
+
+                byte[] bgra32 = TextureFile.DecodeManagedData(
+                    encodedData,
+                    (TextureFormat)format,
+                    width,
+                    height,
+                    useBgra: true)
                     ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
 
                 if (bgra32.Length != width * height * 4)
@@ -133,23 +144,18 @@ internal static class Program
 
                 byte[] rgba32 = SwapRedAndBlue(bgra32);
 
-                // --- 3. Patch fields back via the type tree (no offset math) -----------
-                baseField["m_TextureFormat"].AsInt = kFmtRGBA32;
-                baseField["m_MipCount"].AsInt = 1;
-                baseField["m_CompleteImageSize"].AsInt = rgba32.Length;
+                // --- 3. Rebuild the TextureFile consistently ---------------------------
+                // RGBA32 is stored inline, so there is no .resS offset to patch manually.
+                // SetPictureData also updates m_TextureFormat, m_CompleteImageSize,
+                // m_StreamData, m_MipCount, and m_MipMap as a coherent group.
+                tf.SetPictureData(
+                    rgba32,
+                    width,
+                    height,
+                    (TextureFormat)kFmtRGBA32,
+                    mipCount: 1);
 
-                // Move the pixel data inline and clear the streaming reference. This is the
-                // key simplification vs. the earlier draft: instead of patching the bundle's
-                // .resS blob in place (fragile, and not actually supported by a public API),
-                // the now-uncompressed RGBA32 data just lives in the object itself. The bundle
-                // grows a bit, but Limbus's mod-swap textures are small enough that this is a
-                // non-issue in practice.
-                AssetTypeValueField streamData = baseField["m_StreamData"];
-                streamData["offset"].AsULong = 0;
-                streamData["size"].AsInt = 0;
-                streamData["path"].AsString = string.Empty;
-                baseField["image data"].AsByteArray = rgba32;
-
+                tf.WriteTo(baseField);
                 info.SetNewData(baseField); // re-serializes just this object
                 convertedCount++;
                 fileTouched = true;
@@ -166,14 +172,14 @@ internal static class Program
         using (var outStream = File.Create(outputPath))
         using (var writer = new AssetsFileWriter(outStream))
         {
-            // Writes uncompressed. If you want the original LZ4 compression back (smaller
-            // file, slightly slower to load), re-pack afterward:
-            //   var repacked = new AssetBundleFile();
-            //   using var reread = File.OpenRead(outputPath);
-            //   repacked.Read(new AssetsFileReader(reread));
-            //   using var compStream = File.Create(outputPath + ".lz4");
-            //   repacked.Pack(new AssetsFileWriter(compStream), AssetBundleCompressionType.LZ4);
-            bundle.Write(writer);
+            // Re-pack the doctored bundle using LZ4HC.
+            // In AssetsTools.NET, AssetBundleCompressionType.LZ4 uses the
+            // high-compression LZ4 path (Encode32HC) and writes Unity's
+            // LZ4HC block flags. LZ4Fast is the lower-compression variant.
+            bundle.Pack(
+                writer,
+                AssetBundleCompressionType.LZ4,
+                blockDirAtEnd: true);
         }
 
         Console.WriteLine(
