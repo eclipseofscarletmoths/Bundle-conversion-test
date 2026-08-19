@@ -25,8 +25,20 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      - name: Build native ETC2 encoder
+        run: |
+          git clone --depth 1 https://github.com/google/etc2comp.git third_party/etc2comp
+          cmake -S BundleDoctor/native -B native-build \
+            -DETC2COMP_SOURCE_DIR="$PWD/third_party/etc2comp" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build native-build --config Release --parallel
+          cp native-build/libbundle_doctor_etc2.so .
+
       - name: Restore & build converter
         run: dotnet build BundleDoctor/BundleDoctor.csproj -c Release -o build
+        
+      - name: Copy native ETC2 encoder beside converter
+        run: cp libbundle_doctor_etc2.so build/
 
       - name: Fetch input.bundle from the queue release
         env:
