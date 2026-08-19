@@ -123,8 +123,19 @@ internal static class Program
                 // automatically when the base field came from a bundle-loaded AssetsFileInstance,
                 // and fall back to inline "image data" otherwise -- no manual offset math needed.
                 TextureFile tf = TextureFile.ReadTextureFile(baseField);
-                byte[] bgra32 = tf.GetTextureData(afileInst)
-                    ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
+
+                byte[] encodedData = tf.FillPictureData(afileInst)
+                 ?? throw new InvalidDataException(
+                  $"could not load texture data for '{texName}'");
+
+                byte[] bgra32 = TextureFile.DecodeManagedData(
+                 encodedData,
+                 (TextureFormat)format,
+                 width,
+                 height,
+                 useBgra: true)
+                 ?? throw new InvalidDataException(
+                 $"could not decode texture data for '{texName}'");
 
                 if (bgra32.Length != width * height * 4)
                     throw new InvalidDataException(
