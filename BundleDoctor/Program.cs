@@ -16,7 +16,7 @@ using System;
 using System.IO;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
-using AstcSharp; // thin wrapper around Texture2DDecoder's DecodeDXT1/DecodeDXT5/UnpackCrunch
+using Texture2DDecoderWrapper; // thin wrapper around Texture2DDecoder's DecodeDXT1/DecodeDXT5/UnpackCrunch
 
 internal static class Program
 {
