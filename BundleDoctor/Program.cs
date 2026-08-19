@@ -127,15 +127,17 @@ internal static class Program
                 TextureFile tf = TextureFile.ReadTextureFile(baseField);
 
                 byte[] encodedData = tf.FillPictureData(afileInst)
-                    ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
+                 ?? throw new InvalidDataException(
+                  $"could not load texture data for '{texName}'");
 
                 byte[] bgra32 = TextureFile.DecodeManagedData(
-                    encodedData,
-                    (TextureFormat)format,
-                    width,
-                    height,
-                    useBgra: true)
-                    ?? throw new InvalidDataException($"could not decode texture data for '{texName}'");
+                 encodedData,
+                 (TextureFormat)format,
+                 width,
+                 height,
+                 useBgra: true)
+                 ?? throw new InvalidDataException(
+                 $"could not decode texture data for '{texName}'");
 
                 if (bgra32.Length != width * height * 4)
                     throw new InvalidDataException(
