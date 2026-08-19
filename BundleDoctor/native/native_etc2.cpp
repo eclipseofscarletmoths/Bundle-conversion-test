@@ -46,20 +46,20 @@ int etc2_encode_rgba8(
         unsigned int extendedHeight = 0;
         int encodingTimeMs = 0;
 
-        auto status = Etc::Encode(
-            source,
-            width,
-            height,
-            format,
-            metric,
-            effort,
-            jobs,
-            jobs,
-            &encoded,
-            &encodedLength,
-            &extendedWidth,
-            &extendedHeight,
-            &encodingTimeMs);
+        Etc::Encode(
+        source,
+        width,
+        height,
+        format,
+        metric,
+        effort,
+        jobs,
+        jobs,
+        &encoded,
+        &encodedLength,
+        &extendedWidth,
+        &extendedHeight,
+        &encodingTimeMs);
 
         (void)status;
         if (!encoded || encodedLength == 0) {
