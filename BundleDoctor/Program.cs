@@ -392,7 +392,6 @@ internal static class Program
     {
         // Desktop-only / unsupported formats: decode then re-encode.
         kFmtRGB24 => true,
-        kFmtRGBA32 => true,
         kFmtDXT1 => true,
         kFmtDXT5 => true,
         kFmtDXT5Crunched => true,
@@ -402,6 +401,7 @@ internal static class Program
         kFmtETC2_RGBA8 => false,
         kFmtASTC_RGBA_4x4 => false,
         kFmtASTC_RGBA_6x6 => false,
+        kFmtRGBA32 => false,
 
         _ => throw new NotSupportedException(
             $"texture format {format} has no conversion rule; failing closed rather than guessing")
