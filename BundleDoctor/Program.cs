@@ -120,18 +120,20 @@ internal static class Program
                     Path.GetTempPath(),
                     $"BundleDoctor-input-{Guid.NewGuid():N}.unity3d");
 
+                // AssetsTools.NET's AssetBundleFile.Unpack() is the canonical way to
+                // materialize an LZ4/LZ4HC UnityFS bundle. It writes a new, genuinely
+                // uncompressed UnityFS file and does not leave the working bundle backed
+                // by the original LZ4BlockStream.
                 using (var unpackedStream = File.Create(tempInputUnpackedPath))
+                using (var unpackedWriter = new AssetsFileWriter(unpackedStream))
                 {
-                    loadedInput.file =
-                        BundleHelper.UnpackBundleToStream(
-                            loadedInput.file,
-                            unpackedStream);
-
-                    // The helper returns an uncompressed AssetBundleFile. Remove that
-                    // temporary in-memory instance before closing the stream, then reload
-                    // from disk so the working bundle has a normal file-backed reader.
-                    manager.UnloadBundleFile(loadedInput);
+                    loadedInput.file.Unpack(unpackedWriter);
                 }
+
+                // We no longer need the original compressed reader. Closing it before
+                // reopening the materialized file also prevents accidental reads from
+                // the old LZ4 block stream.
+                manager.UnloadBundleFile(loadedInput);
 
                 // Every subsequent operation now works against a genuinely uncompressed
                 // bundle. No LZ4 block stream remains in the texture/asset read path.
@@ -186,16 +188,26 @@ internal static class Program
             if (!LooksLikeSerializedFile(dirInfo.Name))
                 continue;
 
-            AssetsFileInstance afileInst;
+            AssetsFileInstance? afileInst = null;
             try
             {
                 afileInst = manager.LoadAssetsFileFromBundle(bunInst, dirIndex, loadDeps: false);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Not every non-.resS entry is necessarily a serialized file (e.g. loose
-                // .resource blobs with no recognizable suffix) -- skip anything that fails
-                // to parse as one rather than guessing.
+                // Not every non-.resS entry is necessarily a SerializedFile. LZ4
+                // decompression can also expose auxiliary files that have no useful
+                // AssetsFile representation. Skip those rather than dereferencing a
+                // null AssetsFileInstance.
+                Console.WriteLine(
+                    $"[{dirInfo.Name}] skipped: LoadAssetsFileFromBundle threw {ex.GetType().Name}: {ex.Message}");
+                continue;
+            }
+
+            if (afileInst == null || afileInst.file == null)
+            {
+                Console.WriteLine(
+                    $"[{dirInfo.Name}] skipped: entry is not a readable SerializedFile (AssetsFileInstance was null).");
                 continue;
             }
 
