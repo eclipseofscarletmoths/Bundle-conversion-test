@@ -11,8 +11,9 @@
 //     (default: RGBA32); ASTC 4x4/6x6 use AstcSharp and ETC2 uses the optional native encoder
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
+//   - fully decompresses compressed input bundles before any asset/texture mutation
 //   - materializes AssetsTools.NET replacers with Write(), then reloads and repacks
-//     the materialized bundle as LZ4HC
+//     the materialized bundle once as LZ4HC
 //
 // NuGet:
 //   AssetsTools.NET 3.0.2
@@ -91,8 +92,88 @@ internal static class Program
             manager.LoadClassPackage(tpkPath);
         }
 
-        BundleFileInstance bunInst = manager.LoadBundleFile(inputPath, unpackIfPacked: true);
-        AssetBundleFile bundle = bunInst.file;
+        // Always materialize a compressed UnityFS input into a genuinely uncompressed
+        // bundle before touching any SerializedFiles or Texture2D data.
+        //
+        // AssetsTools.NET's normal LZ4 path uses an LZ4BlockStream and transparently
+        // decompresses blocks as they are read. That is fine for reading, but it still
+        // leaves the working AssetBundleFile backed by compressed bundle data. We want
+        // exactly one compression boundary in this pipeline: the final Pack() below.
+        string? tempInputUnpackedPath = null;
+        BundleFileInstance bunInst;
+        AssetBundleFile bundle;
+
+        try
+        {
+            BundleFileInstance loadedInput =
+                manager.LoadBundleFile(inputPath, unpackIfPacked: false);
+
+            AssetBundleCompressionType inputCompression =
+                loadedInput.file.GetCompressionType();
+
+            Console.WriteLine(
+                $"[bundle] Input compression: {inputCompression}");
+
+            if (inputCompression != AssetBundleCompressionType.None)
+            {
+                tempInputUnpackedPath = Path.Combine(
+                    Path.GetTempPath(),
+                    $"BundleDoctor-input-{Guid.NewGuid():N}.unity3d");
+
+                using (var unpackedStream = File.Create(tempInputUnpackedPath))
+                {
+                    loadedInput.file =
+                        BundleHelper.UnpackBundleToStream(
+                            loadedInput.file,
+                            unpackedStream);
+
+                    // The helper returns an uncompressed AssetBundleFile. Remove that
+                    // temporary in-memory instance before closing the stream, then reload
+                    // from disk so the working bundle has a normal file-backed reader.
+                    manager.UnloadBundleFile(loadedInput);
+                }
+
+                // Every subsequent operation now works against a genuinely uncompressed
+                // bundle. No LZ4 block stream remains in the texture/asset read path.
+                bunInst = manager.LoadBundleFile(
+                    tempInputUnpackedPath,
+                    unpackIfPacked: false);
+
+                bundle = bunInst.file;
+
+                AssetBundleCompressionType workingCompression =
+                    bundle.GetCompressionType();
+
+                if (workingCompression != AssetBundleCompressionType.None ||
+                    bundle.DataIsCompressed)
+                {
+                    throw new InvalidDataException(
+                        $"failed to fully decompress input bundle; " +
+                        $"working compression={workingCompression}, " +
+                        $"DataIsCompressed={bundle.DataIsCompressed}");
+                }
+
+                Console.WriteLine(
+                    "[bundle] Input was fully decompressed to an uncompressed working bundle.");
+            }
+            else
+            {
+                bunInst = loadedInput;
+                bundle = bunInst.file;
+                Console.WriteLine(
+                    "[bundle] Input is already uncompressed; no decompression step required.");
+            }
+        }
+        catch
+        {
+            if (tempInputUnpackedPath != null)
+            {
+                try { File.Delete(tempInputUnpackedPath); } catch { }
+            }
+
+            manager.UnloadAll();
+            throw;
+        }
 
         int convertedCount = 0;
         int totalTextures = 0;
@@ -380,6 +461,13 @@ internal static class Program
         finally
         {
             verifyManager.UnloadAll();
+        }
+
+        // The primary working bundle may be backed by a temporary decompressed file.
+        manager.UnloadAll();
+        if (tempInputUnpackedPath != null)
+        {
+            try { File.Delete(tempInputUnpackedPath); } catch { }
         }
 
         Console.WriteLine(
