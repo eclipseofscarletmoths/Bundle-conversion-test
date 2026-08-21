@@ -76,10 +76,21 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        // New reverse-direction pipeline - see TransplantMode.cs's header
+        // comment for why this exists alongside (not instead of) the
+        // desktop->iOS convert mode below. Dispatched on args[0] so the
+        // existing `BundleDoctor <input> <output> ...` invocation (still used
+        // by doctor-bundle.yml) is completely unaffected.
+        if (args.Length > 0 && string.Equals(args[0], "transplant", StringComparison.OrdinalIgnoreCase))
+        {
+            return TransplantMode.Run(args[1..]);
+        }
+
         if (args.Length < 2)
         {
             Console.Error.WriteLine(
-                "usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]");
+                "usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]\n" +
+                "   or: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> [--threshold N] [--dry-run] [--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 
