@@ -78,7 +78,19 @@ internal static class UnityFsLz4Transcoder
         bool blocksInfoAtEnd = (flags & 0x80) != 0;
         uint blocksInfoCompressionType = flags & 0x3Fu;
 
+        // BlockInfoNeedPaddingAtStart (0x200): whatever comes immediately after the
+        // header - the embedded blocks-info when !blocksInfoAtEnd, or the first data
+        // block when blocksInfoAtEnd - is 16-byte aligned. Pack() sets this bit (see
+        // the matching 0x200 literal in BuildArchive's own header-flags write below),
+        // so the read side has to honor it too, or every offset computed from
+        // headerEnd onward silently drifts by up to 15 bytes. That drift doesn't
+        // necessarily fail on the very first block it touches - LZ4 has few
+        // guardrails against decoding misaligned-but-plausible bytes - so it can
+        // surface several blocks later as a decode failure instead of immediately,
+        // which is what made this one hard to spot from the exception site alone.
         int headerEnd = pos;
+        if ((flags & 0x200) != 0)
+            headerEnd = AlignUp16(headerEnd);
 
         int blocksInfoStart = blocksInfoAtEnd
             ? packed.Length - (int)compressedBlocksInfoSize
@@ -266,6 +278,12 @@ internal static class UnityFsLz4Transcoder
     }
 
     // --- Bounds-checked big-endian primitives ------------------------------
+
+    // Rounds a position up to the next 16-byte boundary. Mirrors PadTo16 (which
+    // pads a *stream being written*) but operates on a plain offset into an
+    // already-fully-read-into-memory byte[], since ForceStandardLz4 parses
+    // Pack()'s output that way rather than through a Stream.
+    private static int AlignUp16(int pos) => (pos + 15) & ~15;
 
     private static void ReadSignature(byte[] buf, ref int pos)
     {
