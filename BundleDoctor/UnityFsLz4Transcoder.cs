@@ -110,11 +110,40 @@ internal static class UnityFsLz4Transcoder
 
         int dataStart = blocksInfoAtEnd ? headerEnd : blocksInfoStart + (int)compressedBlocksInfoSize;
 
+        // Sanity-check the block table against the actual data region *before*
+        // attempting to decode anything. If Pack()'s declared per-block
+        // CompressedSize values don't sum to exactly the bytes available between
+        // dataStart and wherever the data region ends, that's proof the block
+        // table itself is wrong/inconsistent with Pack()'s own output - as
+        // opposed to this code's offset math being wrong, which the earlier
+        // "blocks-info" decode already having succeeded rules out (blocks-info
+        // read from a correctly-located span; dataStart is derived from that
+        // same, now-validated, span math).
+        int dataRegionEnd = blocksInfoAtEnd ? blocksInfoStart : packed.Length;
+        long declaredDataBytes = 0;
+        foreach (StorageBlock b in sourceBlocks)
+            declaredDataBytes += b.CompressedSize;
+
+        Console.Error.WriteLine(
+            $"[UnityFsLz4Transcoder] blocksInfoAtEnd={blocksInfoAtEnd} dataStart={dataStart} " +
+            $"dataRegionEnd={dataRegionEnd} dataRegionSize={dataRegionEnd - dataStart} " +
+            $"declaredDataBytes={declaredDataBytes} blockCount={sourceBlocks.Count}");
+
+        if (declaredDataBytes != dataRegionEnd - dataStart)
+        {
+            throw new InvalidDataException(
+                $"Pack()'d bundle's block table doesn't match its data region: " +
+                $"blocks declare {declaredDataBytes:N0} bytes total, but the data region " +
+                $"(dataStart={dataStart} to {(blocksInfoAtEnd ? "blocksInfoStart" : "EOF")}=" +
+                $"{dataRegionEnd}) is {dataRegionEnd - dataStart:N0} bytes.");
+        }
+
         // --- Transcode every data block: HC (or whatever Pack() actually used) -> fast LZ4 ---
         var newBlocks = new List<StorageBlock>(sourceBlocks.Count);
         using var newDataStream = new MemoryStream();
 
         int srcOffset = dataStart;
+        int blockIndex = 0;
         foreach (StorageBlock srcBlock in sourceBlocks)
         {
             if (srcOffset + srcBlock.CompressedSize > packed.Length)
@@ -122,11 +151,31 @@ internal static class UnityFsLz4Transcoder
 
             byte[] compressedSlice = new byte[srcBlock.CompressedSize];
             Array.Copy(packed, srcOffset, compressedSlice, 0, (int)srcBlock.CompressedSize);
+
+            int previewLen = Math.Min(8, compressedSlice.Length);
+            string preview = Convert.ToHexString(compressedSlice, 0, previewLen);
+            Console.Error.WriteLine(
+                $"[UnityFsLz4Transcoder] block {blockIndex}: srcOffset={srcOffset} " +
+                $"compType={srcBlock.Flags & 0x3F} uSize={srcBlock.UncompressedSize} " +
+                $"cSize={srcBlock.CompressedSize} flags=0x{srcBlock.Flags:X4} first{previewLen}bytes={preview}");
+
             srcOffset += (int)srcBlock.CompressedSize;
 
             uint srcBlockCompType = (uint)(srcBlock.Flags & 0x3F);
-            byte[] rawBlockBytes = DecompressGeneric(
-                compressedSlice, srcBlockCompType, (int)srcBlock.UncompressedSize, "data block");
+            byte[] rawBlockBytes;
+            try
+            {
+                rawBlockBytes = DecompressGeneric(
+                    compressedSlice, srcBlockCompType, (int)srcBlock.UncompressedSize, "data block");
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidDataException(
+                    $"Failed decoding block {blockIndex} of {sourceBlocks.Count} " +
+                    $"(srcOffset={srcOffset - srcBlock.CompressedSize}, compType={srcBlockCompType}, " +
+                    $"uSize={srcBlock.UncompressedSize}, cSize={srcBlock.CompressedSize}, " +
+                    $"flags=0x{srcBlock.Flags:X4}, first{previewLen}bytes={preview}): {ex.Message}", ex);
+            }
 
             byte[] fastLz4Bytes = Lz4EncodeBlockFast(rawBlockBytes);
 
@@ -140,6 +189,8 @@ internal static class UnityFsLz4Transcoder
                 // the encoder changes here, not e.g. the streamed bit.
                 Flags = (ushort)((srcBlock.Flags & ~0x3F) | CompressionTypeLz4),
             });
+
+            blockIndex++;
         }
 
         byte[] newData = newDataStream.ToArray();
