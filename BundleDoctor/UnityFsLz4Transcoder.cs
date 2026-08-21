@@ -78,19 +78,14 @@ internal static class UnityFsLz4Transcoder
         bool blocksInfoAtEnd = (flags & 0x80) != 0;
         uint blocksInfoCompressionType = flags & 0x3Fu;
 
-        // BlockInfoNeedPaddingAtStart (0x200): whatever comes immediately after the
-        // header - the embedded blocks-info when !blocksInfoAtEnd, or the first data
-        // block when blocksInfoAtEnd - is 16-byte aligned. Pack() sets this bit (see
-        // the matching 0x200 literal in BuildArchive's own header-flags write below),
-        // so the read side has to honor it too, or every offset computed from
-        // headerEnd onward silently drifts by up to 15 bytes. That drift doesn't
-        // necessarily fail on the very first block it touches - LZ4 has few
-        // guardrails against decoding misaligned-but-plausible bytes - so it can
-        // surface several blocks later as a decode failure instead of immediately,
-        // which is what made this one hard to spot from the exception site alone.
-        int headerEnd = pos;
-        if ((flags & 0x200) != 0)
-            headerEnd = AlignUp16(headerEnd);
+        // The data section (and, when blocksInfo is embedded rather than at EOF,
+        // blocksInfo itself) starts on a 16-byte boundary. This is NOT reliably
+        // signaled by the 0x200 flag bit - a real Pack() output was observed with
+        // that bit clear yet still 16-byte-aligning its data start, confirmed by
+        // block 0's compressed bytes literally beginning with a run of 0x00 padding
+        // (which decodes as an LZ4 offset of 0 - illegal - hence the earlier
+        // decode failures). So align unconditionally rather than gating on the flag.
+        int headerEnd = AlignUp16(pos);
 
         int blocksInfoStart = blocksInfoAtEnd
             ? packed.Length - (int)compressedBlocksInfoSize
@@ -108,7 +103,14 @@ internal static class UnityFsLz4Transcoder
 
         (List<StorageBlock> sourceBlocks, List<NodeEntry> nodes) = ParseBlocksInfo(blocksInfo);
 
-        int dataStart = blocksInfoAtEnd ? headerEnd : blocksInfoStart + (int)compressedBlocksInfoSize;
+        int dataStart = blocksInfoAtEnd
+            ? headerEnd
+            // Mirrors BuildArchive's own two PadTo16 calls (before blocksInfo, then
+            // before data) when writing this same layout - unverified directly since
+            // our observed failures were all blocksInfoAtEnd=true, but included for
+            // symmetry since the same "16-byte align before the next section" rule
+            // demonstrably applies to the other boundary in this format.
+            : AlignUp16(blocksInfoStart + (int)compressedBlocksInfoSize);
 
         // Sanity-check the block table against the actual data region *before*
         // attempting to decode anything. A small (<16 byte) gap here is expected
