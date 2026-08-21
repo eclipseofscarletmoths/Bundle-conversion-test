@@ -12,14 +12,17 @@
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - fully decompresses compressed input bundles before any asset/texture mutation
-//   - materializes AssetsTools.NET replacers with Write(), then reloads and repacks
-//     the materialized bundle once as LZ4HC
+//   - materializes AssetsTools.NET replacers with Write(), then hand-packs the
+//     materialized bundle once as genuine standard LZ4 (UnityFsLz4Packer.cs) -
+//     not LZ4HC, and not via AssetsTools.NET's own Pack(), see that file for why
 //
 // NuGet:
 //   AssetsTools.NET 3.0.2
 //   AssetsTools.NET.Texture 3.0.2 (raw Texture2D data access only)
 //   Kyaru.Texture2DDecoder 0.17.1 + Kyaru.Texture2DDecoder.Linux 0.2.0
 //   AstcSharp 3.1.0
+//   K4os.Compression.LZ4 1.3.8 (real standard/fast LZ4 block encoder, used only by
+//   UnityFsLz4Packer.cs's final compression step - see that file)
 //
 // Usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]
 //
@@ -357,7 +360,16 @@ internal static class Program
         //
         // Therefore the write pipeline must be two-stage:
         //   1. Write() -> materialize all replacers into a fresh, uncompressed bundle.
-        //   2. Reload that fresh bundle -> Pack() it as LZ4HC.
+        //   2. Read that fresh bundle's raw bytes back and pack them into a real
+        //      standard-LZ4 UnityFS archive by hand (UnityFsLz4Packer) - NOT via
+        //      AssetsTools.NET's own Pack(), which always routes block compression
+        //      through its Encode32HC path regardless of which
+        //      AssetBundleCompressionType is requested (LZ4 vs LZ4HC there only
+        //      changed the declared compression-type byte, not the actual encoder).
+        //      Limbus Company uses standard LZ4 for its own bundles, and chokes on
+        //      genuinely HC-encoded ones - see UnityFsLz4Packer.cs for the full
+        //      writeup and why this is a hand-rolled packer rather than a Pack()
+        //      call with a different enum value.
         string tempUnpackedPath = Path.Combine(
             Path.GetTempPath(),
             $"BundleDoctor-{Guid.NewGuid():N}.unity3d");
@@ -370,31 +382,9 @@ internal static class Program
                 bundle.Write(tempWriter, 0);
             }
 
-            // Reload the materialized bundle so Pack() reads the doctored bytes rather
-            // than the original bundle's DataReader stream.
-            var repackManager = new AssetsManager();
-            try
-            {
-                BundleFileInstance materialized = repackManager.LoadBundleFile(
-                    tempUnpackedPath, unpackIfPacked: true);
-
-                using (var outStream = File.Create(outputPath))
-                using (var writer = new AssetsFileWriter(outStream))
-                {
-                    // AssetsTools.NET's LZ4 mode uses the Encode32HC path for the
-                    // high-compression blocks.
-                    materialized.file.Pack(
-                        writer,
-                        AssetBundleCompressionType.LZ4,
-                        blockDirAtEnd: true);
-                }
-
-                materialized.file.Close();
-            }
-            finally
-            {
-                repackManager.UnloadAll();
-            }
+            byte[] materializedBytes = File.ReadAllBytes(tempUnpackedPath);
+            byte[] packedBytes = UnityFsLz4Packer.PackAsStandardLz4(materializedBytes);
+            File.WriteAllBytes(outputPath, packedBytes);
         }
         finally
         {
