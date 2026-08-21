@@ -68,7 +68,7 @@ jobs:
       # BundleDoctorService.m). `gh release download` exits non-zero when its
       # --pattern matches nothing, so that failure is swallowed here and
       # absence is just "no shader-restore pass this run", not a job failure.
-      - name: Fetch original.bundle from the queue release, if present
+      - name: Fetch original.bundle from the queue release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -97,7 +97,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
-      - name: Mark done (lets the client stop polling on a cheap signal)
+      - name: Mark Done Signal
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
