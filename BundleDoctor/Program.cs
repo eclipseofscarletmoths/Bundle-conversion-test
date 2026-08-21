@@ -12,17 +12,18 @@
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - fully decompresses compressed input bundles before any asset/texture mutation
-//   - materializes AssetsTools.NET replacers with Write(), then hand-packs the
-//     materialized bundle once as genuine standard LZ4 (UnityFsLz4Packer.cs) -
-//     not LZ4HC, and not via AssetsTools.NET's own Pack(), see that file for why
+//   - materializes AssetsTools.NET replacers with Write(), packs the result with
+//     AssetsTools.NET's own Pack() for a structurally correct archive, then
+//     UnityFsLz4Transcoder.cs re-encodes every block as genuine standard LZ4 -
+//     not LZ4HC, and not just a relabeled LZ4HC stream - see that file for why
 //
 // NuGet:
 //   AssetsTools.NET 3.0.2
 //   AssetsTools.NET.Texture 3.0.2 (raw Texture2D data access only)
 //   Kyaru.Texture2DDecoder 0.17.1 + Kyaru.Texture2DDecoder.Linux 0.2.0
 //   AstcSharp 3.1.0
-//   K4os.Compression.LZ4 1.3.8 (real standard/fast LZ4 block encoder, used only by
-//   UnityFsLz4Packer.cs's final compression step - see that file)
+//   K4os.Compression.LZ4 1.3.8 (real standard/fast LZ4 block encode/decode, used only
+//   by UnityFsLz4Transcoder.cs's block transcoding step - see that file)
 //
 // Usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]
 //
@@ -358,21 +359,34 @@ internal static class Program
         // immediately after SetNewData(af) silently discards BOTH the target-platform
         // change and any Texture2D replacements.
         //
-        // Therefore the write pipeline must be two-stage:
-        //   1. Write() -> materialize all replacers into a fresh, uncompressed bundle.
-        //   2. Read that fresh bundle's raw bytes back and pack them into a real
-        //      standard-LZ4 UnityFS archive by hand (UnityFsLz4Packer) - NOT via
-        //      AssetsTools.NET's own Pack(), which always routes block compression
-        //      through its Encode32HC path regardless of which
+        // The write pipeline is three-stage:
+        //   1. Write() -> materialize all replacers into a fresh, uncompressed bundle
+        //      (this is what actually bakes in the retarget + texture edits).
+        //   2. Re-load that materialized (replacer-free) bundle and hand it to
+        //      AssetsTools.NET's own Pack(), requesting LZ4. This gets us a
+        //      structurally correct archive - real multi-block chunking, node/
+        //      directory table, header framing - all genuine AssetsTools.NET code,
+        //      none of it hand-rolled. The one thing Pack() gets wrong is the actual
+        //      encoder: it always compresses through its HC path regardless of which
         //      AssetBundleCompressionType is requested (LZ4 vs LZ4HC there only
-        //      changed the declared compression-type byte, not the actual encoder).
-        //      Limbus Company uses standard LZ4 for its own bundles, and chokes on
-        //      genuinely HC-encoded ones - see UnityFsLz4Packer.cs for the full
-        //      writeup and why this is a hand-rolled packer rather than a Pack()
-        //      call with a different enum value.
+        //      changes the declared compression-type byte, not the encoder that
+        //      ran). LZ4 and LZ4HC decode with the same algorithm, but Limbus
+        //      Company's own loader is known to choke on genuinely HC-encoded
+        //      blocks, so mislabeling HC bytes as flag 2 (as opposed to requesting
+        //      LZ4HC and correctly labeling them 3) is not an acceptable fix here -
+        //      the bytes themselves need to be real standard LZ4, not just declared
+        //      as such.
+        //   3. UnityFsLz4Transcoder walks Pack()'s output block-by-block and
+        //      transcodes each one to genuine standard/fast LZ4 (LZ4Level.L00_FAST) -
+        //      decompress + re-encode per block, in place. It does not rebuild the
+        //      container itself; only compressed bytes and each block's declared
+        //      size change. See that file's header comment for the full writeup.
         string tempUnpackedPath = Path.Combine(
             Path.GetTempPath(),
             $"BundleDoctor-{Guid.NewGuid():N}.unity3d");
+        string tempPackedPath = Path.Combine(
+            Path.GetTempPath(),
+            $"BundleDoctor-packed-{Guid.NewGuid():N}.unity3d");
 
         try
         {
@@ -382,13 +396,34 @@ internal static class Program
                 bundle.Write(tempWriter, 0);
             }
 
-            byte[] materializedBytes = File.ReadAllBytes(tempUnpackedPath);
-            byte[] packedBytes = UnityFsLz4Packer.PackAsStandardLz4(materializedBytes);
-            File.WriteAllBytes(outputPath, packedBytes);
+            var packManager = new AssetsManager();
+            try
+            {
+                BundleFileInstance materializedInst =
+                    packManager.LoadBundleFile(tempUnpackedPath, unpackIfPacked: false);
+
+                using (var packedStream = File.Create(tempPackedPath))
+                using (var packedWriter = new AssetsFileWriter(packedStream))
+                {
+                    // Requested type is LZ4; Pack() will actually emit HC-encoded
+                    // bytes under that label regardless - the transcoder below fixes
+                    // that by re-encoding every block for real.
+                    materializedInst.file.Pack(packedWriter, AssetBundleCompressionType.LZ4);
+                }
+            }
+            finally
+            {
+                packManager.UnloadAll();
+            }
+
+            byte[] packedBytes = File.ReadAllBytes(tempPackedPath);
+            byte[] forcedLz4Bytes = UnityFsLz4Transcoder.ForceStandardLz4(packedBytes);
+            File.WriteAllBytes(outputPath, forcedLz4Bytes);
         }
         finally
         {
             try { File.Delete(tempUnpackedPath); } catch { }
+            try { File.Delete(tempPackedPath); } catch { }
         }
 
         // Final verification: reload the actual output and make sure the serialized
@@ -437,7 +472,7 @@ internal static class Program
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine(
-                        $"ERROR: could not verify serialized file '{verifyDir.Name}': {ex.Message}");
+                        $"ERROR: could not verify serialized file '{verifyDir.Name}': {ex}");
                     return 1;
                 }
             }
