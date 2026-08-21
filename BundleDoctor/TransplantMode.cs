@@ -66,13 +66,20 @@ internal static class TransplantMode
     // rounding noise starts to dominate the score.
     private const int DefaultGridSize = 48;
 
-    // Mean-abs-difference threshold (0-255 scale, see TextureCodec.
-    // MeanAbsoluteDifference) above which a texture is treated as genuinely
-    // changed rather than just re-compressed/re-sized noise. Deliberately
-    // exposed via --threshold rather than hardcoded, since the right value
-    // depends on how aggressively the two builds' compressors round color -
-    // run once with --dry-run and read the logged score for every texture
-    // before trusting a threshold on a real transplant.
+    // 95th-percentile cell-difference threshold (0-255 scale, see
+    // TextureCodec.Percentile95CellDifference) above which a texture is
+    // treated as genuinely changed rather than just re-compressed/re-sized
+    // codec noise. This scorer looks at the top 5% of grid cells rather than
+    // the whole-grid mean, so it stays low for uniform cross-codec
+    // quantization noise and only spikes when a real edit clusters heavy
+    // differences in a region of the texture. Deliberately exposed via
+    // --threshold rather than hardcoded, since the right value depends on
+    // how aggressively the two builds' compressors round color - run once
+    // with --dry-run and read the logged score for every texture before
+    // trusting a threshold on a real transplant. This default is a starting
+    // point, not carried over from the old mean-based scorer - the two
+    // scorers are on different scales, so recalibrate against your own
+    // --dry-run output rather than assuming 4.0 still means the same thing.
     private const double DefaultThreshold = 4.0;
 
     private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
@@ -363,7 +370,7 @@ internal static class TransplantMode
 
                     byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, origWidth, origHeight, DefaultGridSize);
                     byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, moddedWidth, moddedHeight, DefaultGridSize);
-                    double diff = TextureCodec.MeanAbsoluteDifference(origGrid, moddedGrid);
+                    double diff = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
 
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: " +
@@ -616,7 +623,13 @@ internal static class TransplantMode
         "RGBA32" => TextureCodec.FmtRGBA32,
         "ASTC_RGBA_4X4" => TextureCodec.FmtASTC_RGBA_4x4,
         "ASTC_RGBA_6X6" => TextureCodec.FmtASTC_RGBA_6x6,
+        "ASTC_8X8" => TextureCodec.FmtASTC_RGBA_8x8,
+        "ASTC_RGBA_8X8" => TextureCodec.FmtASTC_RGBA_8x8,
+        "ASTC8X8" => TextureCodec.FmtASTC_RGBA_8x8,
+        "ETC2" => TextureCodec.FmtETC2_RGBA8,
+        "ETC2_RGBA8" => TextureCodec.FmtETC2_RGBA8,
+        "ETC2_RGB" => TextureCodec.FmtETC2_RGB,
         _ => throw new ArgumentException(
-            $"Unknown --new-texture-format '{value}'. Use RGBA32, ASTC_RGBA_4x4, or ASTC_RGBA_6x6.")
+            $"Unknown --new-texture-format '{value}'. Use RGBA32, ETC2, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6, or ASTC_RGBA_8x8.")
     };
 }

@@ -38,6 +38,7 @@ internal static class TextureCodec
     public const int FmtETC2_RGBA8 = 47;
     public const int FmtASTC_RGBA_4x4 = 48;
     public const int FmtASTC_RGBA_6x6 = 50;
+    public const int FmtASTC_RGBA_8x8 = 51; // Unity ASTC 8x8
 
     public static string FormatName(int format) => format switch
     {
@@ -50,6 +51,7 @@ internal static class TextureCodec
         FmtETC2_RGBA8 => "ETC2_RGBA8",
         FmtASTC_RGBA_4x4 => "ASTC_RGBA_4x4",
         FmtASTC_RGBA_6x6 => "ASTC_RGBA_6x6",
+        FmtASTC_RGBA_8x8 => "ASTC_RGBA_8x8",
         _ => $"Format{format}"
     };
 
@@ -99,6 +101,9 @@ internal static class TextureCodec
             case FmtASTC_RGBA_6x6:
                 return DecodeAstc(encodedData, width, height, FootprintType.Footprint6x6, texName);
 
+            case FmtASTC_RGBA_8x8:
+                return DecodeAstc(encodedData, width, height, FootprintType.Footprint8x8, texName);
+
             default:
                 throw new NotSupportedException(
                     $"TextureCodec has no decoder for format {format} ('{texName}'); " +
@@ -108,10 +113,9 @@ internal static class TextureCodec
 
     /// <summary>
     /// Encodes RGBA32 pixels into the requested output format. Only the
-    /// formats the original iOS bundle is known to actually use are
-    /// implemented (RGBA32 uncompressed, ASTC 4x4/6x6) - same restriction
-    /// Program.cs's EncodeOutputTexture already has for ETC2, kept consistent
-    /// here rather than silently falling back to something else.
+    /// formats supported by the re-encoder are implemented here: RGBA32,
+    /// ASTC 4x4/6x6/8x8, and ETC2 RGB/RGBA8. ETC2 is delegated to the vendored
+    /// native wolfpld/etcpak encoder; no format silently falls back to another.
     /// </summary>
     public static byte[] EncodeFromRgba32(byte[] rgba32, int width, int height, int outputFormat, string texName)
     {
@@ -126,12 +130,12 @@ internal static class TextureCodec
             case FmtASTC_RGBA_6x6:
                 return EncodeAstc(rgba32, width, height, FootprintType.Footprint6x6, texName);
 
+            case FmtASTC_RGBA_8x8:
+                return EncodeAstc(rgba32, width, height, FootprintType.Footprint8x8, texName);
+
             case FmtETC2_RGB:
             case FmtETC2_RGBA8:
-                throw new NotSupportedException(
-                    $"ETC2 output ({FormatName(outputFormat)}) is not available in this Kyaru-based build " +
-                    $"for '{texName}'. A texture whose original slot is ETC2-encoded cannot currently be " +
-                    "transplant-updated; add a native ETC2 encoder before selecting it as a transplant target.");
+                return Etc2Encoder.Encode(rgba32, width, height, outputFormat, texName);
 
             default:
                 throw new NotSupportedException(
@@ -241,7 +245,13 @@ internal static class TextureCodec
         AstcEncoder.CompressImage(source, destination, width, height, footprint);
         byte[] blocks = destination.ToArray();
 
-        int blockWidth = footprintType == FootprintType.Footprint4x4 ? 4 : 6;
+        int blockWidth = footprintType switch
+        {
+            FootprintType.Footprint4x4 => 4,
+            FootprintType.Footprint6x6 => 6,
+            FootprintType.Footprint8x8 => 8,
+            _ => throw new ArgumentOutOfRangeException(nameof(footprintType), $"Unsupported ASTC footprint {footprintType}")
+        };
         int expectedSize = checked(
             ((width + blockWidth - 1) / blockWidth) *
             ((height + blockWidth - 1) / blockWidth) *
@@ -327,26 +337,64 @@ internal static class TextureCodec
     }
 
     /// <summary>
-    /// Mean absolute per-channel difference between two same-size grids
-    /// (0-255 scale, averaged across all channels and cells). Straightforward
-    /// on purpose: content edits (a swapped costume, a recolored sprite) push
-    /// this into the tens or hundreds; re-encoding the same picture through a
-    /// different compressor at a different resolution generally keeps it in
-    /// low single digits. Log the score for every texture (see TransplantMode)
-    /// so the threshold can be calibrated against real assets rather than
-    /// guessed once and trusted forever.
+    /// 95th-percentile per-cell difference between two same-size grids
+    /// (0-255 scale). Replaces a flat whole-grid mean, which two things were
+    /// polluting: (1) cross-codec quantization noise (DXT5Crunched vs ASTC
+    /// decode to slightly different RGB even for pixel-identical source art),
+    /// spread evenly across every cell, and (2) alpha carrying full weight
+    /// alongside RGB, which inflated the score for alpha-heavy sprite/UI
+    /// textures whose alpha decode differs between decoders but whose visible
+    /// content didn't change.
+    ///
+    /// Fix, two parts:
+    ///   - Score per CELL, not per raw byte. Each cell collapses its 4
+    ///     channels into one number, with alpha downweighted (kAlphaWeight)
+    ///     relative to R/G/B, so decoder-level alpha noise can't drive the
+    ///     score on its own the way full-weight alpha could.
+    ///   - Take the 95th percentile across cells, not the mean. A real edit
+    ///     (recolored costume, swapped region) lights up a cluster of cells
+    ///     hard, and that cluster survives into the top 5%; uniform
+    ///     low-magnitude codec noise sits in the bottom 95% and gets ignored
+    ///     regardless of how many cells it touches.
+    ///
+    /// Log the score for every texture (see TransplantMode) so the threshold
+    /// can be calibrated against real assets rather than guessed once and
+    /// trusted forever - note the threshold's scale/behavior under this
+    /// scorer differs from the old flat-mean one, so re-run --dry-run and
+    /// re-check the logged scores rather than reusing an old threshold value
+    /// unexamined.
     /// </summary>
-    public static double MeanAbsoluteDifference(byte[] gridA, byte[] gridB)
+    private const double kAlphaWeight = 0.25;
+
+    public static double Percentile95CellDifference(byte[] gridA, byte[] gridB, int gridSize)
     {
         if (gridA.Length != gridB.Length)
             throw new ArgumentException("grids must be the same size to compare");
 
-        long sum = 0;
-        for (int i = 0; i < gridA.Length; i++)
+        int cellCount = gridSize * gridSize;
+        int expected = checked(cellCount * 4);
+        if (gridA.Length != expected)
+            throw new ArgumentException(
+                $"grid length {gridA.Length} doesn't match gridSize {gridSize} (expected {expected})");
+
+        var cellScores = new double[cellCount];
+        for (int c = 0; c < cellCount; c++)
         {
-            sum += Math.Abs(gridA[i] - gridB[i]);
+            int i = c * 4;
+            double dr = Math.Abs(gridA[i + 0] - gridB[i + 0]);
+            double dg = Math.Abs(gridA[i + 1] - gridB[i + 1]);
+            double db = Math.Abs(gridA[i + 2] - gridB[i + 2]);
+            double da = Math.Abs(gridA[i + 3] - gridB[i + 3]);
+            cellScores[c] = (dr + dg + db + da * kAlphaWeight) / (3.0 + kAlphaWeight);
         }
-        return (double)sum / gridA.Length;
+
+        Array.Sort(cellScores);
+
+        // Nearest-rank method: the 95th-percentile element of a sorted
+        // ascending array of length N is at index ceil(0.95*N) - 1.
+        int rank = (int)Math.Ceiling(0.95 * cellCount) - 1;
+        rank = Math.Clamp(rank, 0, cellCount - 1);
+        return cellScores[rank];
     }
 
     /// <summary>

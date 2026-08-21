@@ -10,6 +10,35 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- ETC2 is implemented by the vendored wolfpld/etcpak C++ encoder (a
+       minimal ProcessRGB.cpp-only build - see native/etcpak/CMakeLists.txt).
+       The MSBuild hooks build it automatically when cmake is available and copy
+       the resulting executable beside BundleDoctor for published runs. -->
+  <Target Name="BuildVendoredEtcpakEncoder" BeforeTargets="Build">
+    <Exec Command="cmake -S &quot;$(MSBuildProjectDirectory)/native/etcpak&quot; -B &quot;$(MSBuildProjectDirectory)/native/etcpak/build&quot; -DCMAKE_BUILD_TYPE=Release" />
+    <Exec Command="cmake --build &quot;$(MSBuildProjectDirectory)/native/etcpak/build&quot; --config Release --parallel" />
+  </Target>
+
+  <Target Name="CopyVendoredEtcpakEncoderToPublish" AfterTargets="Publish">
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/etcpak/build/etcpak_encode')">
+      <PublishedEtcpakBinary Include="$(MSBuildProjectDirectory)/native/etcpak/build/etcpak_encode" />
+    </ItemGroup>
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/etcpak/build/Release/etcpak_encode.exe')">
+      <PublishedEtcpakBinary Include="$(MSBuildProjectDirectory)/native/etcpak/build/Release/etcpak_encode.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PublishedEtcpakBinary)" DestinationFolder="$(PublishDir)/native/etcpak/build" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyVendoredEtcpakEncoder" AfterTargets="Build">
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/etcpak/build/etcpak_encode')">
+      <EtcpakBinary Include="$(MSBuildProjectDirectory)/native/etcpak/build/etcpak_encode" />
+    </ItemGroup>
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/etcpak/build/Release/etcpak_encode.exe')">
+      <EtcpakBinary Include="$(MSBuildProjectDirectory)/native/etcpak/build/Release/etcpak_encode.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(EtcpakBinary)" DestinationFolder="$(OutputPath)/native/etcpak/build" SkipUnchangedFiles="true" />
+  </Target>
+
   <ItemGroup>
     <!-- Schema-driven asset/bundle reading & writing -->
     <PackageReference Include="AssetsTools.NET" Version="3.0.2" />

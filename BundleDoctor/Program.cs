@@ -69,9 +69,10 @@ internal static class Program
     private const int kFmtETC2_RGBA8 = 47;
     private const int kFmtASTC_RGBA_4x4 = 48;
     private const int kFmtASTC_RGBA_6x6 = 50;
+    private const int kFmtASTC_RGBA_8x8 = 51;
 
     // Default output format. The workflow can override this with the final CLI argument.
-    // Accepted names: RGBA32, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6.
+    // Accepted names: RGBA32, ETC2, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6, ASTC_RGBA_8x8.
     private const int kDefaultOutputTextureFormat = kFmtRGBA32;
 
     private static int Main(string[] args)
@@ -715,6 +716,7 @@ internal static class Program
         kFmtETC2_RGBA8 => false,
         kFmtASTC_RGBA_4x4 => false,
         kFmtASTC_RGBA_6x6 => false,
+        kFmtASTC_RGBA_8x8 => false,
         kFmtRGBA32 => false,
 
         _ => throw new NotSupportedException(
@@ -729,16 +731,21 @@ internal static class Program
         return value.Trim().ToUpperInvariant() switch
         {
             "RGBA32" => true,
+            "ETC2" => true,
             "ETC2_RGB" => true,
             "ETC2_RGBA8" => true,
             "ASTC_RGBA_4X4" => true,
             "ASTC_RGBA_6X6" => true,
+            "ASTC_8X8" => true,
+            "ASTC_RGBA_8X8" => true,
+            "ASTC8X8" => true,
             "3" => true,
             "4" => true,
             "45" => true,
             "47" => true,
             "48" => true,
             "50" => true,
+            "51" => true,
             _ => false
         };
     }
@@ -755,15 +762,20 @@ internal static class Program
             "ETC2_RGBA8" => kFmtETC2_RGBA8,
             "ASTC_RGBA_4X4" => kFmtASTC_RGBA_4x4,
             "ASTC_RGBA_6X6" => kFmtASTC_RGBA_6x6,
+            "ASTC_8X8" => kFmtASTC_RGBA_8x8,
+            "ASTC_RGBA_8X8" => kFmtASTC_RGBA_8x8,
+            "ASTC8X8" => kFmtASTC_RGBA_8x8,
+            "ETC2" => kFmtETC2_RGBA8,
             "3" => kFmtRGB24,
             "4" => kFmtRGBA32,
             "45" => kFmtETC2_RGB,
             "47" => kFmtETC2_RGBA8,
             "48" => kFmtASTC_RGBA_4x4,
             "50" => kFmtASTC_RGBA_6x6,
+            "51" => kFmtASTC_RGBA_8x8,
             _ => throw new ArgumentException(
                 $"Unknown output texture format '{value}'. " +
-                "Use RGBA32, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, or ASTC_RGBA_6x6.")
+                "Use RGBA32, ETC2, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6, or ASTC_RGBA_8x8.")
         };
     }
 
@@ -774,6 +786,7 @@ internal static class Program
         kFmtETC2_RGBA8 => "ETC2_RGBA8",
         kFmtASTC_RGBA_4x4 => "ASTC_RGBA_4x4",
         kFmtASTC_RGBA_6x6 => "ASTC_RGBA_6x6",
+        kFmtASTC_RGBA_8x8 => "ASTC_RGBA_8x8",
         _ => $"Format{format}"
     };
 
@@ -808,11 +821,18 @@ internal static class Program
                     outputFormat,
                     texName);
 
+            case kFmtASTC_RGBA_8x8:
+                return EncodeAstc(
+                    rgba32,
+                    width,
+                    height,
+                    FootprintType.Footprint8x8,
+                    outputFormat,
+                    texName);
+
             case kFmtETC2_RGB:
             case kFmtETC2_RGBA8:
-                throw new NotSupportedException(
-                    $"ETC2 output ({FormatName(outputFormat)}) is not available in this Kyaru-based " +
-                    "build. Remove this case or add the native ETC2 encoder before selecting it.");
+                return Etc2Encoder.Encode(rgba32, width, height, outputFormat, texName);
 
             default:
                 throw new NotSupportedException(
@@ -835,7 +855,13 @@ internal static class Program
         AstcEncoder.CompressImage(source, destination, width, height, footprint);
         byte[] blocks = destination.ToArray();
 
-        int blockWidth = footprintType == FootprintType.Footprint4x4 ? 4 : 6;
+        int blockWidth = footprintType switch
+        {
+            FootprintType.Footprint4x4 => 4,
+            FootprintType.Footprint6x6 => 6,
+            FootprintType.Footprint8x8 => 8,
+            _ => throw new ArgumentOutOfRangeException(nameof(footprintType), $"Unsupported ASTC footprint {footprintType}")
+        };
         int expectedSize = checked(
             ((width + blockWidth - 1) / blockWidth) *
             ((height + blockWidth - 1) / blockWidth) *

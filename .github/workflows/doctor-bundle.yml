@@ -15,10 +15,12 @@ on:
         type: choice
         options:
           - RGBA32
+          - ETC2
           - ETC2_RGB
           - ETC2_RGBA8
           - ASTC_RGBA_4x4
           - ASTC_RGBA_6x6
+          - ASTC_RGBA_8x8
 
 # Least-privilege: this token can only touch this repo's releases/contents,
 # not your account broadly. Still, treat the PAT the tweak uses to trigger
@@ -36,6 +38,18 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+
+      # native/etcpak/build only depends on the vendored etcpak sources, not
+      # on anything that changes per-run (input.bundle, output_format) - so
+      # it's safe to cache keyed on those sources. dotnet build's
+      # BuildVendoredEtcpakEncoder MSBuild target always invokes cmake, but a
+      # cache hit here means that's just a fast incremental no-op (cmake/make
+      # see nothing changed) instead of a cold compile of ProcessRGB.cpp.
+      - name: Cache vendored etcpak build
+        uses: actions/cache@v4
+        with:
+          path: BundleDoctor/native/etcpak/build
+          key: etcpak-build-${{ runner.os }}-${{ hashFiles('BundleDoctor/native/etcpak/**') }}
 
       - name: Restore & build converter
         run: dotnet build BundleDoctor/BundleDoctor.csproj -c Release -o build
