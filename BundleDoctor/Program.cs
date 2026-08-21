@@ -12,6 +12,16 @@
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - fully decompresses compressed input bundles before any asset/texture mutation
+//   - if --original is given, restores every Shader object's raw bytes from the
+//     original (untouched, correctly-platformed) bundle byte-for-byte, keyed by
+//     PathId within each same-named SerializedFile. Shader objects carry
+//     platform-specific pre-compiled data this pipeline has no way to
+//     re-target - re-serializing them through AssetsTools.NET at all (even
+//     untouched) has been the actual source of shader corruption, not the
+//     LZ4HC/LZ4 mislabeling this project first suspected. The original bundle
+//     is only ever read from, never written to, and is fully discarded
+//     (originalManager.UnloadAll()) once every SerializedFile has been
+//     processed, before the Write()/Pack()/transcode stage below runs.
 //   - materializes AssetsTools.NET replacers with Write(), packs the result with
 //     AssetsTools.NET's own Pack() for a structurally correct archive, then
 //     UnityFsLz4Transcoder.cs re-encodes every block as genuine standard LZ4 -
@@ -25,9 +35,16 @@
 //   K4os.Compression.LZ4 1.3.8 (real standard/fast LZ4 block encode/decode, used only
 //   by UnityFsLz4Transcoder.cs's block transcoding step - see that file)
 //
-// Usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]
+// Usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]
+//
+// --original is order-independent and is stripped out of args before the
+// existing positional outputFormat/classdata.tpk parsing runs, so it does
+// not shift either of those. Omitting it just skips the shader-restore
+// pass entirely (logged, not an error) - e.g. when the client couldn't
+// resolve a matching original via UnityCacheLocator.
 //
 using System;
+using System.Collections.Generic;
 using System.IO;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
@@ -61,28 +78,51 @@ internal static class Program
     {
         if (args.Length < 2)
         {
-            Console.Error.WriteLine("usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]");
+            Console.Error.WriteLine(
+                "usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]");
             return 2;
         }
 
-        string inputPath = args[0];
-        string outputPath = args[1];
+        // Pull --original <path> out first (order-independent) so the existing
+        // positional parsing below for outputFormat/classdata.tpk never has to
+        // know about it.
+        var positional = new List<string>(args);
+        string? originalBundlePath = null;
+        for (int i = 0; i < positional.Count - 1; i++)
+        {
+            if (string.Equals(positional[i], "--original", StringComparison.OrdinalIgnoreCase))
+            {
+                originalBundlePath = positional[i + 1];
+                positional.RemoveRange(i, 2);
+                break;
+            }
+        }
+
+        if (positional.Count < 2)
+        {
+            Console.Error.WriteLine(
+                "usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]");
+            return 2;
+        }
+
+        string inputPath = positional[0];
+        string outputPath = positional[1];
 
         string? tpkPath = null;
         string outputFormatName = "RGBA32";
 
-        if (args.Length >= 3)
+        if (positional.Count >= 3)
         {
             // If the third argument is a recognized format, treat it as the output format.
             // Otherwise retain the legacy third-argument classdata.tpk position.
-            if (IsOutputTextureFormatName(args[2]))
-                outputFormatName = args[2];
+            if (IsOutputTextureFormatName(positional[2]))
+                outputFormatName = positional[2];
             else
-                tpkPath = args[2];
+                tpkPath = positional[2];
         }
 
-        if (args.Length >= 4)
-            outputFormatName = args[3];
+        if (positional.Count >= 4)
+            outputFormatName = positional[3];
 
         int outputTextureFormat =
             ParseOutputTextureFormat(outputFormatName, kDefaultOutputTextureFormat);
@@ -185,6 +225,82 @@ internal static class Program
         int totalTextures = 0;
         int touchedFiles = 0;
         int retargetedFiles = 0;
+        int totalShaders = 0;
+        int shadersRestored = 0;
+        int shadersMissingInOriginal = 0;
+
+        // --- Original-bundle shader restore: load once, index by SerializedFile
+        // name -> (PathId -> AssetFileInfo), read-only for the lifetime of the
+        // main loop below. Never written to, never packed - only ever a source
+        // of raw bytes to copy out of. See this file's header comment.
+        AssetsManager? originalManager = null;
+        var originalShaderIndex = new Dictionary<string, Dictionary<long, AssetFileInfo>>();
+        var originalFileInstances = new Dictionary<string, AssetsFileInstance>();
+
+        if (originalBundlePath != null)
+        {
+            originalManager = new AssetsManager();
+            try
+            {
+                // Deliberately NOT unpacked/decompressed like the modded input
+                // above: this bundle is only ever read from at a byte offset via
+                // its own AssetsFileReader, which transparently decompresses
+                // through an LZ4BlockStream just fine for reads - the earlier
+                // "materialize to a genuinely uncompressed file first" step exists
+                // solely because Pack() further down can't work through that
+                // stream, and we never Pack() this one.
+                BundleFileInstance originalBunInst =
+                    originalManager.LoadBundleFile(originalBundlePath, unpackIfPacked: false);
+
+                for (int i = 0; i < originalBunInst.file.BlockAndDirInfo.DirectoryInfos.Count; i++)
+                {
+                    var origDirInfo = originalBunInst.file.BlockAndDirInfo.DirectoryInfos[i];
+                    if (!LooksLikeSerializedFile(origDirInfo.Name))
+                        continue;
+
+                    AssetsFileInstance? origAfileInst;
+                    try
+                    {
+                        origAfileInst = originalManager.LoadAssetsFileFromBundle(originalBunInst, i, loadDeps: false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"[original:{origDirInfo.Name}] skipped: LoadAssetsFileFromBundle threw {ex.GetType().Name}: {ex.Message}");
+                        continue;
+                    }
+
+                    if (origAfileInst == null || origAfileInst.file == null)
+                        continue;
+
+                    var pathIdToInfo = new Dictionary<long, AssetFileInfo>();
+                    foreach (AssetFileInfo shaderInfo in origAfileInst.file.GetAssetsOfType(AssetClassID.Shader))
+                    {
+                        pathIdToInfo[shaderInfo.PathId] = shaderInfo;
+                    }
+
+                    originalFileInstances[origDirInfo.Name] = origAfileInst;
+                    originalShaderIndex[origDirInfo.Name] = pathIdToInfo;
+                }
+
+                Console.WriteLine(
+                    $"[original] Loaded '{originalBundlePath}': " +
+                    $"{originalShaderIndex.Count} SerializedFile(s) indexed for shader restore.");
+            }
+            catch (Exception ex)
+            {
+                // --original was explicitly requested - failing to open it should
+                // not silently fall back to "no shader restore", since that's
+                // exactly the corrupted-shader failure mode this exists to fix.
+                originalManager.UnloadAll();
+                throw new InvalidDataException(
+                    $"--original was given ('{originalBundlePath}') but could not be loaded: {ex.Message}", ex);
+            }
+        }
+        else
+        {
+            Console.WriteLine("[original] No --original given; skipping shader restore pass.");
+        }
 
         for (int dirIndex = 0; dirIndex < bundle.BlockAndDirInfo.DirectoryInfos.Count; dirIndex++)
         {
@@ -346,12 +462,73 @@ internal static class Program
                 fileTouched = true;
             }
 
+            // --- 3. Restore Shader objects byte-for-byte from the original bundle ---
+            // Deliberately raw-byte, not field-by-field like the Texture2D loop
+            // above: Shader objects hold opaque platform-compiled program data
+            // this pipeline has no way to interpret or re-target, and running it
+            // through AssetTypeValueField/SetNewData(AssetTypeValueField) at all -
+            // even with every field left alone - has been the actual source of
+            // shader corruption. Copying the exact original bytes back in
+            // sidesteps re-serialization entirely for these objects.
+            if (originalShaderIndex.TryGetValue(dirInfo.Name, out Dictionary<long, AssetFileInfo>? origPathIdToInfo) &&
+                originalFileInstances.TryGetValue(dirInfo.Name, out AssetsFileInstance? origAfileInst))
+            {
+                foreach (AssetFileInfo shaderInfo in af.GetAssetsOfType(AssetClassID.Shader))
+                {
+                    totalShaders++;
+
+                    if (!origPathIdToInfo.TryGetValue(shaderInfo.PathId, out AssetFileInfo? origInfo))
+                    {
+                        shadersMissingInOriginal++;
+                        Console.WriteLine(
+                            $"[{dirInfo.Name}] shader PathId {shaderInfo.PathId} not found in original bundle; " +
+                            "leaving this object's bytes as-is.");
+                        continue;
+                    }
+
+                    AssetsFileReader origReader = origAfileInst.file.Reader;
+                    long origOffset = origInfo.GetAbsoluteByteOffset(origAfileInst.file);
+                    origReader.Position = origOffset;
+                    byte[] rawShaderBytes = origReader.ReadBytes((int)origInfo.ByteSize);
+
+                    shaderInfo.SetNewData(rawShaderBytes);
+                    shadersRestored++;
+                    fileTouched = true;
+                }
+            }
+            else if (originalBundlePath != null)
+            {
+                // --original was given but this particular SerializedFile had no
+                // same-named counterpart in it - e.g. the modded bundle contains
+                // an extra file the original doesn't. Any Shader objects in here
+                // are left exactly as the modded upload had them.
+                int shaderCountHere = 0;
+                foreach (AssetFileInfo _ in af.GetAssetsOfType(AssetClassID.Shader)) shaderCountHere++;
+                if (shaderCountHere > 0)
+                {
+                    Console.WriteLine(
+                        $"[{dirInfo.Name}] no matching SerializedFile in original bundle; " +
+                        $"{shaderCountHere} shader(s) here left un-restored.");
+                }
+            }
+
             // --- 4. Write the modified SerializedFile back into the bundle directory ---
             if (fileTouched)
             {
                 dirInfo.SetNewData(af);
                 touchedFiles++;
             }
+        }
+
+        // The original bundle has served its only purpose (a source of raw Shader
+        // bytes for the loop above) - discard it now, before the compress stage,
+        // rather than holding it open any longer than necessary.
+        if (originalManager != null)
+        {
+            originalManager.UnloadAll();
+            Console.WriteLine(
+                $"[original] Discarded. Shaders restored: {shadersRestored}/{totalShaders} " +
+                $"({shadersMissingInOriginal} had no match in the original).");
         }
 
         // IMPORTANT: AssetBundleFile.Pack() streams DataReader.BaseStream directly and
@@ -509,7 +686,8 @@ internal static class Program
 
         Console.WriteLine(
             $"Converted {convertedCount}/{totalTextures} textures across {touchedFiles} " +
-            $"serialized file(s); retargeted {retargetedFiles} file(s). Wrote and verified {outputPath}.");
+            $"serialized file(s); retargeted {retargetedFiles} file(s); restored " +
+            $"{shadersRestored}/{totalShaders} shader(s) from original. Wrote and verified {outputPath}.");
         return 0;
     }
 

@@ -49,12 +49,31 @@ jobs:
             --pattern "input.bundle" \
             --output input.bundle
 
+      # original.bundle is optional - the client only uploads it when
+      # UnityCacheLocator resolved a matching stock bundle on-device (see
+      # BundleDoctorService.m). `gh release download` exits non-zero when its
+      # --pattern matches nothing, so that failure is swallowed here and
+      # absence is just "no shader-restore pass this run", not a job failure.
+      - name: Fetch original.bundle from the queue release, if present
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "original.bundle" \
+            --output original.bundle || true
+
       - name: Run BundleDoctor
         env:
           OUTPUT_FORMAT: ${{ inputs.output_format }}
         run: |
           FORMAT="${OUTPUT_FORMAT:-RGBA32}"
-          dotnet build/BundleDoctor.dll input.bundle output.bundle "$FORMAT"
+          if [ -f original.bundle ]; then
+            dotnet build/BundleDoctor.dll input.bundle output.bundle --original original.bundle "$FORMAT"
+          else
+            echo "No original.bundle on this release - running without shader restore."
+            dotnet build/BundleDoctor.dll input.bundle output.bundle "$FORMAT"
+          fi
 
       - name: Upload output.bundle back onto the same release
         env:
