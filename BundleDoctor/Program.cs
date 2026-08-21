@@ -12,17 +12,14 @@
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - fully decompresses compressed input bundles before any asset/texture mutation
-//   - materializes AssetsTools.NET replacers with Write(), then hand-packs the
-//     materialized bundle once as genuine standard LZ4 (UnityFsLz4Packer.cs) -
-//     not LZ4HC, and not via AssetsTools.NET's own Pack(), see that file for why
+//   - materializes AssetsTools.NET replacers with Write(), then reloads and repacks
+//     the materialized bundle once as standard LZ4 (not LZ4HC)
 //
 // NuGet:
 //   AssetsTools.NET 3.0.2
 //   AssetsTools.NET.Texture 3.0.2 (raw Texture2D data access only)
 //   Kyaru.Texture2DDecoder 0.17.1 + Kyaru.Texture2DDecoder.Linux 0.2.0
 //   AstcSharp 3.1.0
-//   K4os.Compression.LZ4 1.3.8 (real standard/fast LZ4 block encoder, used only by
-//   UnityFsLz4Packer.cs's final compression step - see that file)
 //
 // Usage: BundleDoctor <input.bundle> <output.bundle> [outputFormat] [classdata.tpk]
 //
@@ -34,6 +31,7 @@ using AssetsTools.NET.Texture;
 using AstcSharp;
 using AstcSharp.Core;
 using Texture2DDecoder;
+using LZ4ps;
 
 internal static class Program
 {
@@ -360,16 +358,7 @@ internal static class Program
         //
         // Therefore the write pipeline must be two-stage:
         //   1. Write() -> materialize all replacers into a fresh, uncompressed bundle.
-        //   2. Read that fresh bundle's raw bytes back and pack them into a real
-        //      standard-LZ4 UnityFS archive by hand (UnityFsLz4Packer) - NOT via
-        //      AssetsTools.NET's own Pack(), which always routes block compression
-        //      through its Encode32HC path regardless of which
-        //      AssetBundleCompressionType is requested (LZ4 vs LZ4HC there only
-        //      changed the declared compression-type byte, not the actual encoder).
-        //      Limbus Company uses standard LZ4 for its own bundles, and chokes on
-        //      genuinely HC-encoded ones - see UnityFsLz4Packer.cs for the full
-        //      writeup and why this is a hand-rolled packer rather than a Pack()
-        //      call with a different enum value.
+        //   2. Reload that fresh bundle -> repack it as standard LZ4.
         string tempUnpackedPath = Path.Combine(
             Path.GetTempPath(),
             $"BundleDoctor-{Guid.NewGuid():N}.unity3d");
@@ -382,14 +371,37 @@ internal static class Program
                 bundle.Write(tempWriter, 0);
             }
 
-            byte[] materializedBytes = File.ReadAllBytes(tempUnpackedPath);
-            byte[] packedBytes = UnityFsLz4Packer.PackAsStandardLz4(materializedBytes);
-            File.WriteAllBytes(outputPath, packedBytes);
+            // Reload the materialized bundle so Pack() reads the doctored bytes rather
+            // than the original bundle's DataReader stream.
+            var repackManager = new AssetsManager();
+            try
+            {
+                BundleFileInstance materialized = repackManager.LoadBundleFile(
+                    tempUnpackedPath, unpackIfPacked: true);
+
+                using (var outStream = File.Create(outputPath))
+                using (var writer = new AssetsFileWriter(outStream))
+                {
+                    // IMPORTANT: AssetsTools.NET's Pack(LZ4) implementation uses
+                    // Encode32HC and writes compression type 3 (LZ4HC). Its
+                    // Pack(LZ4Fast) path uses normal LZ4, but still writes the
+                    // bundle header as LZ4HC. Use our own packer so both the
+                    // payload blocks and UnityFS compression flags are standard LZ4.
+                    PackStandardLz4(materialized.file, writer);
+                }
+
+                materialized.file.Close();
+            }
+            finally
+            {
+                repackManager.UnloadAll();
+            }
         }
         finally
         {
             try { File.Delete(tempUnpackedPath); } catch { }
         }
+
 
         // Final verification: reload the actual output and make sure the serialized
         // files that can be parsed are now targeting iOS. This turns a silent no-op
@@ -398,6 +410,30 @@ internal static class Program
         try
         {
             BundleFileInstance verifyBundle = verifyManager.LoadBundleFile(outputPath, unpackIfPacked: true);
+
+            // Final compression verification: standard LZ4 is type 2. Type 3 is
+            // LZ4HC, so reject the output if either the UnityFS header or any
+            // compressed storage block advertises HC.
+            int headerCompressionType =
+                (int)verifyBundle.file.Header.FileStreamHeader.Flags & 0x3F;
+
+            if (headerCompressionType != 2)
+            {
+                throw new InvalidDataException(
+                    $"final bundle is not standard LZ4: header compression type={headerCompressionType}");
+            }
+
+            foreach (AssetBundleBlockInfo block in verifyBundle.file.BlockAndDirInfo.BlockInfos)
+            {
+                if (block.GetCompressionType() == 3)
+                {
+                    throw new InvalidDataException(
+                        "final bundle contains an LZ4HC storage block.");
+                }
+            }
+
+            Console.WriteLine("[verify] Final bundle compression: standard LZ4 (type 2).");
+
             int verifiedSerializedFiles = 0;
             int verifiedTextures = 0;
             int remainingDesktopTextureFormats = 0;
@@ -477,6 +513,167 @@ internal static class Program
             $"serialized file(s); retargeted {retargetedFiles} file(s). Wrote and verified {outputPath}.");
         return 0;
     }
+
+    private static void PackStandardLz4(
+        AssetBundleFile bundle,
+        AssetsFileWriter writer,
+        bool blockDirAtEnd = true)
+    {
+        if (bundle.Header == null)
+            throw new InvalidDataException("Bundle header is not loaded.");
+
+        if (bundle.Header.Signature != "UnityFS")
+            throw new NotSupportedException("Only UnityFS bundles can be repacked.");
+
+        if (bundle.DataIsCompressed)
+            throw new InvalidDataException(
+                "The working bundle must be uncompressed before standard LZ4 packing.");
+
+        // UnityFS compression type 2 is standard LZ4; type 3 is LZ4HC.
+        // AssetsTools.NET's Pack(LZ4) selects HC internally, so this helper
+        // implements the final UnityFS repack explicitly with Encode32.
+        const AssetBundleFSHeaderFlags standardLz4Flags =
+            (AssetBundleFSHeaderFlags)0x42; // 0x02 LZ4 + 0x40 HasDirectoryInfo
+
+        AssetBundleFSHeader newFsHeader = new AssetBundleFSHeader
+        {
+            TotalFileSize = 0,
+            CompressedSize = 0,
+            DecompressedSize = 0,
+            Flags = standardLz4Flags |
+                (blockDirAtEnd
+                    ? AssetBundleFSHeaderFlags.BlockAndDirAtEnd
+                    : AssetBundleFSHeaderFlags.None)
+        };
+
+        AssetBundleHeader newHeader = new AssetBundleHeader
+        {
+            Signature = bundle.Header.Signature,
+            Version = bundle.Header.Version,
+            GenerationVersion = bundle.Header.GenerationVersion,
+            EngineVersion = bundle.Header.EngineVersion,
+            FileStreamHeader = newFsHeader
+        };
+
+        Stream dataStream = bundle.DataReader.BaseStream;
+        dataStream.Position = 0;
+
+        if (dataStream.Length > int.MaxValue)
+            throw new InvalidDataException(
+                "Bundle data exceeds the maximum size supported by this packer.");
+
+        var compressedBlocks = new List<byte[]>();
+        var blockInfos = new List<AssetBundleBlockInfo>();
+
+        byte[] buffer = new byte[0x20000];
+        int remaining = checked((int)dataStream.Length);
+
+        while (remaining > 0)
+        {
+            int toRead = Math.Min(buffer.Length, remaining);
+            int totalRead = 0;
+
+            while (totalRead < toRead)
+            {
+                int read = dataStream.Read(buffer, totalRead, toRead - totalRead);
+                if (read <= 0)
+                    throw new EndOfStreamException("Unexpected end of the bundle data stream.");
+                totalRead += read;
+            }
+
+            byte[] uncompressedBlock = new byte[toRead];
+            Buffer.BlockCopy(buffer, 0, uncompressedBlock, 0, toRead);
+
+            byte[] compressedBlock =
+                LZ4Codec.Encode32(uncompressedBlock, 0, uncompressedBlock.Length);
+
+            if (compressedBlock.Length > uncompressedBlock.Length)
+            {
+                compressedBlocks.Add(uncompressedBlock);
+                blockInfos.Add(new AssetBundleBlockInfo
+                {
+                    CompressedSize = (uint)uncompressedBlock.Length,
+                    DecompressedSize = (uint)uncompressedBlock.Length,
+                    Flags = 0x00
+                });
+            }
+            else
+            {
+                compressedBlocks.Add(compressedBlock);
+                blockInfos.Add(new AssetBundleBlockInfo
+                {
+                    CompressedSize = (uint)compressedBlock.Length,
+                    DecompressedSize = (uint)uncompressedBlock.Length,
+                    Flags = 0x02 // standard LZ4; 0x03 is LZ4HC
+                });
+            }
+
+            remaining -= toRead;
+        }
+
+        AssetBundleBlockAndDirInfo newBlockAndDirList = new AssetBundleBlockAndDirInfo
+        {
+            Hash = new Hash128(),
+            BlockInfos = blockInfos.ToArray(),
+            DirectoryInfos = bundle.BlockAndDirInfo.DirectoryInfos
+        };
+
+        byte[] bundleInfoBytes;
+        using (MemoryStream infoStream = new MemoryStream())
+        {
+            using (AssetsFileWriter infoWriter = new AssetsFileWriter(infoStream))
+            {
+                infoWriter.BigEndian = writer.BigEndian;
+                newBlockAndDirList.Write(infoWriter);
+            }
+
+            bundleInfoBytes = infoStream.ToArray();
+        }
+
+        // Keep the blocks-info blob standard LZ4 too.
+        byte[] compressedInfo =
+            LZ4Codec.Encode32(bundleInfoBytes, 0, bundleInfoBytes.Length);
+
+        writer.Position = 0;
+        long headerStart = writer.Position;
+
+        newHeader.FileStreamHeader.TotalFileSize = 0;
+        newHeader.FileStreamHeader.CompressedSize = (uint)compressedInfo.Length;
+        newHeader.FileStreamHeader.DecompressedSize = (uint)bundleInfoBytes.Length;
+
+        // Write a placeholder header so the file layout and header size are fixed.
+        newHeader.Write(writer);
+
+        if (newHeader.Version >= 7)
+            writer.Align16();
+
+        int headerSize = checked((int)(writer.Position - headerStart));
+
+        // UnityFS layout used by AssetsTools.NET:
+        //   header
+        //   compressed blocks-info
+        //   block payloads
+        writer.Write(compressedInfo, 0, compressedInfo.Length);
+
+        long totalCompressedSize = 0;
+        foreach (byte[] block in compressedBlocks)
+        {
+            writer.Write(block, 0, block.Length);
+            totalCompressedSize += block.Length;
+        }
+
+        long totalFileSize =
+            checked((long)headerSize + compressedInfo.Length + totalCompressedSize);
+
+        newHeader.FileStreamHeader.TotalFileSize = totalFileSize;
+
+        writer.Position = headerStart;
+        newHeader.Write(writer);
+
+        if (newHeader.Version >= 7)
+            writer.Align16();
+    }
+
 
     private static bool NeedsConversion(int format) => format switch
     {
