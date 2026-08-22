@@ -82,6 +82,23 @@ internal static class TransplantMode
     // --dry-run output rather than assuming 4.0 still means the same thing.
     private const double DefaultThreshold = 4.0;
 
+    // A cell only counts as "hot" once its own difference is well past
+    // ordinary quantization drift between codecs - 20.0 is deliberately
+    // higher than the old flat Percentile95 threshold, since this number is
+    // no longer trying to reject noise on its own; ChangedAreaFraction below
+    // does that job by also requiring the hot cells to cover real area.
+    private const double DefaultCellMagnitudeThreshold = 20.0;
+
+    // Fraction of the 48x48 grid that must be "hot" before a texture counts
+    // as genuinely changed - i.e. a real amount of surface area, not just a
+    // thin cluster along an edge/outline where cross-codec quantization bias
+    // concentrates. 0.02 = ~2% of cells (roughly 46 of 2304 on the default
+    // grid), which a stray edge-noise cluster along an icon's outline won't
+    // reach but an actual recolored region/swapped costume comfortably will.
+    // Like DefaultThreshold, this is a starting point - use --dry-run and
+    // read the logged area/magnitude numbers before trusting it on real assets.
+    private const double DefaultMinChangedAreaFraction = 0.02;
+
     private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
 
     private sealed class Options
@@ -91,6 +108,8 @@ internal static class TransplantMode
         public string OutputPath = "";
         public string? TpkPath;
         public double Threshold = DefaultThreshold;
+        public double CellMagnitudeThreshold = DefaultCellMagnitudeThreshold;
+        public double MinChangedAreaFraction = DefaultMinChangedAreaFraction;
         public bool DryRun;
         public int NewTextureFormat = DefaultNewTextureFormat;
     }
@@ -102,12 +121,14 @@ internal static class TransplantMode
         {
             Console.Error.WriteLine(
                 "usage: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> " +
-                "[--threshold N] [--dry-run] [--new-texture-format FMT] [classdata.tpk]");
+                "[--cell-threshold N] [--min-changed-area FRACTION] [--dry-run] " +
+                "[--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 
         Console.WriteLine(
-            $"[config] threshold={opt.Threshold:F2} dry-run={opt.DryRun} " +
+            $"[config] cell-threshold={opt.CellMagnitudeThreshold:F2} " +
+            $"min-changed-area={opt.MinChangedAreaFraction:P1} dry-run={opt.DryRun} " +
             $"new-texture-format={TextureCodec.FormatName(opt.NewTextureFormat)}");
 
         var originalManager = new AssetsManager();
@@ -370,15 +391,26 @@ internal static class TransplantMode
 
                     byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, origWidth, origHeight, DefaultGridSize);
                     byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, moddedWidth, moddedHeight, DefaultGridSize);
-                    double diff = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
+
+                    // Logged for calibration (see --dry-run guidance above) but no
+                    // longer the decision by itself: a single worst cell can't tell
+                    // "modder recolored this" apart from "quantization bias along
+                    // this texture's outline", since both look like a cluster of
+                    // elevated cells. areaFraction below requires the elevated
+                    // cells to also cover real surface area before calling it changed.
+                    double p95 = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
+                    double areaFraction = TextureCodec.ChangedAreaFraction(
+                        origGrid, moddedGrid, DefaultGridSize, opt.CellMagnitudeThreshold);
+                    bool changed = areaFraction >= opt.MinChangedAreaFraction;
 
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: " +
                         $"orig {origWidth}x{origHeight} {TextureCodec.FormatName(origFormat)} vs " +
-                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, diff={diff:F2}" +
-                        (diff > opt.Threshold ? " -> CHANGED" : " -> unchanged"));
+                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, " +
+                        $"p95={p95:F2}, changed-area={areaFraction:P1}" +
+                        (changed ? " -> CHANGED" : " -> unchanged"));
 
-                    if (diff <= opt.Threshold)
+                    if (!changed)
                     {
                         unchanged++;
                         continue;
@@ -592,9 +624,32 @@ internal static class TransplantMode
             }
             else if (string.Equals(positional[i], "--threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
             {
+                // Deprecated: kept only so old scripts calling --threshold don't
+                // hard-fail. It no longer drives the decision (see --cell-threshold
+                // and --min-changed-area) - a single worst cell can't tell a real
+                // edit apart from clustered codec quantization noise on its own.
                 if (!double.TryParse(positional[i + 1], out double t))
                     return null;
                 opt.Threshold = t;
+                Console.Error.WriteLine(
+                    "[warn] --threshold is deprecated and no longer affects the changed/unchanged " +
+                    "decision; use --cell-threshold and --min-changed-area instead.");
+                positional.RemoveRange(i, 2);
+                i--;
+            }
+            else if (string.Equals(positional[i], "--cell-threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
+            {
+                if (!double.TryParse(positional[i + 1], out double t))
+                    return null;
+                opt.CellMagnitudeThreshold = t;
+                positional.RemoveRange(i, 2);
+                i--;
+            }
+            else if (string.Equals(positional[i], "--min-changed-area", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
+            {
+                if (!double.TryParse(positional[i + 1], out double f))
+                    return null;
+                opt.MinChangedAreaFraction = f;
                 positional.RemoveRange(i, 2);
                 i--;
             }

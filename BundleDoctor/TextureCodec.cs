@@ -368,6 +368,42 @@ internal static class TextureCodec
 
     public static double Percentile95CellDifference(byte[] gridA, byte[] gridB, int gridSize)
     {
+        double[] cellScores = ComputeCellScores(gridA, gridB, gridSize);
+        Array.Sort(cellScores);
+
+        // Nearest-rank method: the 95th-percentile element of a sorted
+        // ascending array of length N is at index ceil(0.95*N) - 1.
+        int rank = (int)Math.Ceiling(0.95 * cellScores.Length) - 1;
+        rank = Math.Clamp(rank, 0, cellScores.Length - 1);
+        return cellScores[rank];
+    }
+
+    /// <summary>
+    /// Fraction (0.0-1.0) of grid cells whose per-cell difference exceeds
+    /// cellMagnitudeThreshold. This exists because Percentile95CellDifference
+    /// alone can't distinguish "a modder recolored a real chunk of this
+    /// texture" from "cross-codec quantization bias clustered along this
+    /// texture's edges/text/high-contrast borders" - both produce a cluster
+    /// of elevated cells, since block compressors lose the most precision
+    /// exactly at hard edges, and almost every real texture has some. A
+    /// genuine edit covers a real amount of surface area; edge-quantization
+    /// noise, even when it clusters, stays a thin sliver along outlines.
+    /// Pair this with a minimum-fraction check (see TransplantMode) instead
+    /// of trusting a single worst cell to mean "changed".
+    /// </summary>
+    public static double ChangedAreaFraction(byte[] gridA, byte[] gridB, int gridSize, double cellMagnitudeThreshold)
+    {
+        double[] cellScores = ComputeCellScores(gridA, gridB, gridSize);
+        int hot = 0;
+        foreach (double score in cellScores)
+        {
+            if (score > cellMagnitudeThreshold) hot++;
+        }
+        return (double)hot / cellScores.Length;
+    }
+
+    private static double[] ComputeCellScores(byte[] gridA, byte[] gridB, int gridSize)
+    {
         if (gridA.Length != gridB.Length)
             throw new ArgumentException("grids must be the same size to compare");
 
@@ -387,14 +423,7 @@ internal static class TextureCodec
             double da = Math.Abs(gridA[i + 3] - gridB[i + 3]);
             cellScores[c] = (dr + dg + db + da * kAlphaWeight) / (3.0 + kAlphaWeight);
         }
-
-        Array.Sort(cellScores);
-
-        // Nearest-rank method: the 95th-percentile element of a sorted
-        // ascending array of length N is at index ceil(0.95*N) - 1.
-        int rank = (int)Math.Ceiling(0.95 * cellCount) - 1;
-        rank = Math.Clamp(rank, 0, cellCount - 1);
-        return cellScores[rank];
+        return cellScores;
     }
 
     /// <summary>
