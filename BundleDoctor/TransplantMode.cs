@@ -32,11 +32,18 @@
 //                   trigger a re-encode, only an actual difference in what's
 //                   painted on the texture should. Only textures that come
 //                   back "changed" pay the decode+resample+re-encode cost;
-//                   everything else is left completely byte-for-byte alone.
-//                   This is the resource saving the mod author asked for -
-//                   hundreds of material-referenced textures no longer all
-//                   get re-encoded on every doctor run, only the handful that
-//                   actually changed.
+//                   everything else is left completely byte-for-byte alone,
+//                   at whatever (often smaller) format/size the original
+//                   already used. Textures that DO get re-encoded - changed
+//                   ones and brand-new ones alike - all target the same
+//                   configured --output-format (default RGBA32), never the
+//                   original's own format: re-encoding a changed texture
+//                   back into the original's likely-ASTC format would pay
+//                   the slow-encoder cost this whole diff pass exists to
+//                   avoid. This is the resource saving the mod author asked
+//                   for - hundreds of material-referenced textures no longer
+//                   all get re-encoded on every doctor run, and the handful
+//                   that do use a fast encoder instead of ASTC.
 //
 // Matching key: PathId within same-named SerializedFile, exactly like
 // Program.cs's existing Shader-restore pass already relies on (same build
@@ -99,7 +106,13 @@ internal static class TransplantMode
     // read the logged area/magnitude numbers before trusting it on real assets.
     private const double DefaultMinChangedAreaFraction = 0.02;
 
-    private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
+    // RGBA32 - no compression step at all - matches the "sheer speed" default
+    // Program.cs's convert-everything pipeline already uses, and is the
+    // fastest of the formats this pass can target. Override with
+    // --output-format for ETC2/ETC2_RGBA8 (still fast, meaningfully smaller
+    // than RGBA32) on a bundle where the raw-RGBA size hit is too much even
+    // for just the handful of textures a given mod actually touches.
+    private const int DefaultOutputFormat = TextureCodec.FmtRGBA32;
 
     private sealed class Options
     {
@@ -111,7 +124,7 @@ internal static class TransplantMode
         public double CellMagnitudeThreshold = DefaultCellMagnitudeThreshold;
         public double MinChangedAreaFraction = DefaultMinChangedAreaFraction;
         public bool DryRun;
-        public int NewTextureFormat = DefaultNewTextureFormat;
+        public int OutputFormat = DefaultOutputFormat;
     }
 
     public static int Run(string[] modeArgs)
@@ -122,14 +135,14 @@ internal static class TransplantMode
             Console.Error.WriteLine(
                 "usage: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> " +
                 "[--cell-threshold N] [--min-changed-area FRACTION] [--dry-run] " +
-                "[--new-texture-format FMT] [classdata.tpk]");
+                "[--output-format FMT] [classdata.tpk]");
             return 2;
         }
 
         Console.WriteLine(
             $"[config] cell-threshold={opt.CellMagnitudeThreshold:F2} " +
             $"min-changed-area={opt.MinChangedAreaFraction:P1} dry-run={opt.DryRun} " +
-            $"new-texture-format={TextureCodec.FormatName(opt.NewTextureFormat)}");
+            $"output-format={TextureCodec.FormatName(opt.OutputFormat)}");
 
         var originalManager = new AssetsManager();
         var moddedManager = new AssetsManager();
@@ -417,11 +430,19 @@ internal static class TransplantMode
                     }
 
                     byte[] resampled = TextureCodec.ResampleBilinear(moddedRgba, moddedWidth, moddedHeight, origWidth, origHeight);
-                    byte[] encoded = TextureCodec.EncodeFromRgba32(resampled, origWidth, origHeight, origFormat, texName);
+                    byte[] encoded = TextureCodec.EncodeFromRgba32(resampled, origWidth, origHeight, opt.OutputFormat, texName);
 
                     if (!opt.DryRun)
                     {
-                        origBase["m_TextureFormat"].AsInt = origFormat; // unchanged - keep original's own format
+                        // Deliberately NOT origFormat: origFormat is whatever the
+                        // stock bundle used (typically ASTC), and encoding a changed
+                        // texture into ASTC pays exactly the slow-encoder cost this
+                        // whole diff pass exists to let you skip. Every texture this
+                        // pass actually re-encodes - changed or brand new - goes to
+                        // the same fast opt.OutputFormat (ETC2/RGBA32); only textures
+                        // that come back "unchanged" stay in their original format,
+                        // untouched, at whatever size that already was.
+                        origBase["m_TextureFormat"].AsInt = opt.OutputFormat;
                         origBase["m_MipCount"].AsInt = 1;
                         origBase["m_CompleteImageSize"].AsInt = encoded.Length;
 
@@ -448,27 +469,27 @@ internal static class TransplantMode
                     }
 
                     // No counterpart at all: decode the modded texture and encode it
-                    // fresh into the configured default new-texture format, then
-                    // insert it as a brand new object using the SAME baseField we
-                    // already read from modded (correct field layout for this Unity
-                    // build), just with the format/image-data fields swapped - the
-                    // same in-place mutation the "changed" branch above does, only
-                    // targeting a newly created AssetFileInfo in orig instead of an
-                    // existing one.
+                    // fresh into the same opt.OutputFormat the changed-texture branch
+                    // above uses, then insert it as a brand new object using the SAME
+                    // baseField we already read from modded (correct field layout for
+                    // this Unity build), just with the format/image-data fields
+                    // swapped - the same in-place mutation the "changed" branch above
+                    // does, only targeting a newly created AssetFileInfo in orig
+                    // instead of an existing one.
                     int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
                     int moddedWidth = moddedBase["m_Width"].AsInt;
                     int moddedHeight = moddedBase["m_Height"].AsInt;
 
                     byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
-                    byte[] encoded = TextureCodec.EncodeFromRgba32(moddedRgba, moddedWidth, moddedHeight, opt.NewTextureFormat, texName);
+                    byte[] encoded = TextureCodec.EncodeFromRgba32(moddedRgba, moddedWidth, moddedHeight, opt.OutputFormat, texName);
 
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: not present in original - " +
-                        $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({moddedWidth}x{moddedHeight}).");
+                        $"adding as {TextureCodec.FormatName(opt.OutputFormat)} ({moddedWidth}x{moddedHeight}).");
 
                     if (!opt.DryRun)
                     {
-                        moddedBase["m_TextureFormat"].AsInt = opt.NewTextureFormat;
+                        moddedBase["m_TextureFormat"].AsInt = opt.OutputFormat;
                         moddedBase["m_MipCount"].AsInt = 1;
                         moddedBase["m_CompleteImageSize"].AsInt = encoded.Length;
 
@@ -653,9 +674,11 @@ internal static class TransplantMode
                 positional.RemoveRange(i, 2);
                 i--;
             }
-            else if (string.Equals(positional[i], "--new-texture-format", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
+            else if ((string.Equals(positional[i], "--output-format", StringComparison.OrdinalIgnoreCase) ||
+                      string.Equals(positional[i], "--new-texture-format", StringComparison.OrdinalIgnoreCase)) &&
+                     i + 1 < positional.Count)
             {
-                opt.NewTextureFormat = ParseFormatName(positional[i + 1]);
+                opt.OutputFormat = ParseFormatName(positional[i + 1]);
                 positional.RemoveRange(i, 2);
                 i--;
             }
@@ -685,6 +708,6 @@ internal static class TransplantMode
         "ETC2_RGBA8" => TextureCodec.FmtETC2_RGBA8,
         "ETC2_RGB" => TextureCodec.FmtETC2_RGB,
         _ => throw new ArgumentException(
-            $"Unknown --new-texture-format '{value}'. Use RGBA32, ETC2, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6, or ASTC_RGBA_8x8.")
+            $"Unknown --output-format '{value}'. Use RGBA32, ETC2, ETC2_RGB, ETC2_RGBA8, ASTC_RGBA_4x4, ASTC_RGBA_6x6, or ASTC_RGBA_8x8.")
     };
 }
