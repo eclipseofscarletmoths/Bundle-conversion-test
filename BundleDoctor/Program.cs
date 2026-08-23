@@ -91,7 +91,7 @@ internal static class Program
         {
             Console.Error.WriteLine(
                 "usage: BundleDoctor <input.bundle> <output.bundle> [--original original.bundle] [outputFormat] [classdata.tpk]\n" +
-                "   or: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> [--dry-run] [--new-texture-format FMT] [classdata.tpk]");
+                "   or: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> [--threshold N] [--dry-run] [--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 

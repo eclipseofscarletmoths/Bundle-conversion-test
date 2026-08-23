@@ -24,27 +24,19 @@
 //   - Texture2D   : NOT a raw byte copy - the modded bundle's Texture2D
 //                   objects are desktop-formatted (RGB24/DXT1/DXT5/
 //                   DXT5Crunched typically) and the original's are iOS-
-//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2).
-//                   Deciding which of these actually needs re-encoding used
-//                   to mean decoding both sides to RGBA32 and running a
-//                   dimension-agnostic pixel diff - correct, but expensive
-//                   enough (2 min -> 20+ min on a full bundle) that it wasn't
-//                   worth it: stock bundles stream every Texture2D's image
-//                   data out to a companion .resS file (m_StreamData has a
-//                   non-empty path, and the object's own serialized size
-//                   stays in the low hundreds of bytes), while modding tools
-//                   like UABEA write a replaced texture's image data straight
-//                   back INLINE into the object (m_StreamData.path goes
-//                   empty, and the object's own serialized size balloons into
-//                   the tens-of-millions-of-bytes range). That inline-vs-
-//                   streamed state is itself the signal a mod touched a given
-//                   texture - no pixel decode needed to find out. Only inline
-//                   modded textures (plus any Texture2D absent from original
-//                   entirely) pay the decode+resample+re-encode cost;
-//                   everything still streamed exactly like original is left
-//                   completely byte-for-byte alone and isn't even decoded.
-//                   See TransplantTextures's comment below for the one
-//                   fallback case (both sides inline) this doesn't cover.
+//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2). Every
+//                   Texture2D that exists in both is decoded on both sides to
+//                   plain RGBA32 and compared with TextureCodec's dimension-
+//                   agnostic downsample-and-diff (see that file) - encoding
+//                   differences and resolution differences alone should not
+//                   trigger a re-encode, only an actual difference in what's
+//                   painted on the texture should. Only textures that come
+//                   back "changed" pay the decode+resample+re-encode cost;
+//                   everything else is left completely byte-for-byte alone.
+//                   This is the resource saving the mod author asked for -
+//                   hundreds of material-referenced textures no longer all
+//                   get re-encoded on every doctor run, only the handful that
+//                   actually changed.
 //
 // Matching key: PathId within same-named SerializedFile, exactly like
 // Program.cs's existing Shader-restore pass already relies on (same build
@@ -68,6 +60,28 @@ using AssetsTools.NET.Texture;
 
 internal static class TransplantMode
 {
+    // Downsample grid used for the dimension-agnostic Texture2D content
+    // compare. 48x48 is generous enough to catch a recolored region or a
+    // swapped costume without being so fine-grained that ASTC/DXT block-
+    // rounding noise starts to dominate the score.
+    private const int DefaultGridSize = 48;
+
+    // 95th-percentile cell-difference threshold (0-255 scale, see
+    // TextureCodec.Percentile95CellDifference) above which a texture is
+    // treated as genuinely changed rather than just re-compressed/re-sized
+    // codec noise. This scorer looks at the top 5% of grid cells rather than
+    // the whole-grid mean, so it stays low for uniform cross-codec
+    // quantization noise and only spikes when a real edit clusters heavy
+    // differences in a region of the texture. Deliberately exposed via
+    // --threshold rather than hardcoded, since the right value depends on
+    // how aggressively the two builds' compressors round color - run once
+    // with --dry-run and read the logged score for every texture before
+    // trusting a threshold on a real transplant. This default is a starting
+    // point, not carried over from the old mean-based scorer - the two
+    // scorers are on different scales, so recalibrate against your own
+    // --dry-run output rather than assuming 4.0 still means the same thing.
+    private const double DefaultThreshold = 4.0;
+
     private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
 
     private sealed class Options
@@ -76,6 +90,7 @@ internal static class TransplantMode
         public string ModdedPath = "";
         public string OutputPath = "";
         public string? TpkPath;
+        public double Threshold = DefaultThreshold;
         public bool DryRun;
         public int NewTextureFormat = DefaultNewTextureFormat;
     }
@@ -87,12 +102,12 @@ internal static class TransplantMode
         {
             Console.Error.WriteLine(
                 "usage: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> " +
-                "[--dry-run] [--new-texture-format FMT] [classdata.tpk]");
+                "[--threshold N] [--dry-run] [--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 
         Console.WriteLine(
-            $"[config] dry-run={opt.DryRun} " +
+            $"[config] threshold={opt.Threshold:F2} dry-run={opt.DryRun} " +
             $"new-texture-format={TextureCodec.FormatName(opt.NewTextureFormat)}");
 
         var originalManager = new AssetsManager();
@@ -346,74 +361,29 @@ internal static class TransplantMode
                     int origWidth = origBase["m_Width"].AsInt;
                     int origHeight = origBase["m_Height"].AsInt;
 
-                    // Inline-vs-streamed check (see header comment above) -
-                    // cheap field reads only, no decode. This is what makes
-                    // the common "mod didn't touch this texture" case free:
-                    // both sides streaming to .resS the normal way never
-                    // even reaches a decode call.
-                    bool origStreamed = !string.IsNullOrEmpty(origBase["m_StreamData"]["path"].AsString);
-                    bool moddedStreamed = !string.IsNullOrEmpty(moddedBase["m_StreamData"]["path"].AsString);
-
-                    bool changed;
-                    string reason;
-
-                    if (origStreamed && moddedStreamed)
-                    {
-                        // Both still stream to .resS normally - the mod
-                        // didn't touch this one.
-                        changed = false;
-                        reason = "both streamed";
-                    }
-                    else if (origStreamed && !moddedStreamed)
-                    {
-                        // The telltale sign: original streams this texture
-                        // like every other stock asset, but modded carries it
-                        // fully inline - UABEA's reimport signature, and a
-                        // reliable "this one was edited" flag on its own.
-                        changed = true;
-                        reason = "modded is inline, original is streamed";
-                    }
-                    else if (!origStreamed && !moddedStreamed)
-                    {
-                        // Both inline - happens for small textures (icons,
-                        // tiny UI elements) that never get streamed even in
-                        // the stock build, so inline-vs-streamed can't tell
-                        // us anything here. Fall back to a raw byte compare
-                        // of the two serialized objects - still far cheaper
-                        // than a pixel decode, and exact.
-                        byte[] origRaw = ReadRawBytes(origAf, origInfo);
-                        byte[] moddedRaw = ReadRawBytes(moddedAf, moddedInfo);
-                        changed = !BytesEqual(origRaw, moddedRaw);
-                        reason = "both inline, raw byte compare";
-                    }
-                    else
-                    {
-                        // Original inline, modded streamed - not a shape a
-                        // desktop mod authored from this same original should
-                        // ever produce. Treat conservatively as changed
-                        // rather than silently skip a case that wasn't
-                        // anticipated.
-                        changed = true;
-                        reason = "unexpected: original inline, modded streamed";
-                    }
-
                     int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
                     int moddedWidth = moddedBase["m_Width"].AsInt;
                     int moddedHeight = moddedBase["m_Height"].AsInt;
 
+                    byte[] origRgba = DecodeTextureRgba32(origAfileInst, origBase, origFormat, origWidth, origHeight, texName);
+                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
+
+                    byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, origWidth, origHeight, DefaultGridSize);
+                    byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, moddedWidth, moddedHeight, DefaultGridSize);
+                    double diff = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
+
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: " +
                         $"orig {origWidth}x{origHeight} {TextureCodec.FormatName(origFormat)} vs " +
-                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, {reason}" +
-                        (changed ? " -> CHANGED" : " -> unchanged"));
+                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, diff={diff:F2}" +
+                        (diff > opt.Threshold ? " -> CHANGED" : " -> unchanged"));
 
-                    if (!changed)
+                    if (diff <= opt.Threshold)
                     {
                         unchanged++;
                         continue;
                     }
 
-                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
                     byte[] resampled = TextureCodec.ResampleBilinear(moddedRgba, moddedWidth, moddedHeight, origWidth, origHeight);
                     byte[] encoded = TextureCodec.EncodeFromRgba32(resampled, origWidth, origHeight, origFormat, texName);
 
@@ -618,6 +588,14 @@ internal static class TransplantMode
             {
                 opt.DryRun = true;
                 positional.RemoveAt(i);
+                i--;
+            }
+            else if (string.Equals(positional[i], "--threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
+            {
+                if (!double.TryParse(positional[i + 1], out double t))
+                    return null;
+                opt.Threshold = t;
+                positional.RemoveRange(i, 2);
                 i--;
             }
             else if (string.Equals(positional[i], "--new-texture-format", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)

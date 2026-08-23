@@ -280,13 +280,122 @@ internal static class TextureCodec
         return rgba;
     }
 
-    // Note: this file previously also had a dimension-agnostic pixel-diff
-    // pair (DownsampleToGrid + Percentile95CellDifference) used to decide
-    // which shared Texture2D objects actually changed. Retired in favor of
-    // TransplantMode's inline-vs-streamed m_StreamData check, which answers
-    // the same question from cheap field reads instead of a full decode on
-    // both sides of every shared texture - see TransplantMode.cs's header
-    // comment for the reasoning.
+    // --- dimension-agnostic content comparison -------------------------------
+
+    /// <summary>
+    /// Box-downsamples an RGBA32 buffer of any width/height to a fixed
+    /// gridSize x gridSize grid of averaged RGBA samples. This is what makes
+    /// the diff dimension-agnostic: two textures that differ only because one
+    /// side re-exported at a different resolution (or through a different
+    /// lossy compressor) collapse to the same small grid and compare as
+    /// "unchanged"; two textures with genuinely different painted content
+    /// don't, regardless of their raw width/height.
+    /// </summary>
+    public static byte[] DownsampleToGrid(byte[] rgba32, int width, int height, int gridSize)
+    {
+        var grid = new byte[gridSize * gridSize * 4];
+
+        for (int gy = 0; gy < gridSize; gy++)
+        {
+            int y0 = (int)((long)gy * height / gridSize);
+            int y1 = (int)((long)(gy + 1) * height / gridSize);
+            if (y1 <= y0) y1 = y0 + 1;
+            y1 = Math.Min(y1, height);
+
+            for (int gx = 0; gx < gridSize; gx++)
+            {
+                int x0 = (int)((long)gx * width / gridSize);
+                int x1 = (int)((long)(gx + 1) * width / gridSize);
+                if (x1 <= x0) x1 = x0 + 1;
+                x1 = Math.Min(x1, width);
+
+                long sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+                int count = 0;
+                for (int y = y0; y < y1; y++)
+                {
+                    int rowBase = y * width * 4;
+                    for (int x = x0; x < x1; x++)
+                    {
+                        int i = rowBase + x * 4;
+                        sumR += rgba32[i + 0];
+                        sumG += rgba32[i + 1];
+                        sumB += rgba32[i + 2];
+                        sumA += rgba32[i + 3];
+                        count++;
+                    }
+                }
+
+                int gi = (gy * gridSize + gx) * 4;
+                grid[gi + 0] = (byte)(sumR / count);
+                grid[gi + 1] = (byte)(sumG / count);
+                grid[gi + 2] = (byte)(sumB / count);
+                grid[gi + 3] = (byte)(sumA / count);
+            }
+        }
+
+        return grid;
+    }
+
+    /// <summary>
+    /// 95th-percentile per-cell difference between two same-size grids
+    /// (0-255 scale). Replaces a flat whole-grid mean, which two things were
+    /// polluting: (1) cross-codec quantization noise (DXT5Crunched vs ASTC
+    /// decode to slightly different RGB even for pixel-identical source art),
+    /// spread evenly across every cell, and (2) alpha carrying full weight
+    /// alongside RGB, which inflated the score for alpha-heavy sprite/UI
+    /// textures whose alpha decode differs between decoders but whose visible
+    /// content didn't change.
+    ///
+    /// Fix, two parts:
+    ///   - Score per CELL, not per raw byte. Each cell collapses its 4
+    ///     channels into one number, with alpha downweighted (kAlphaWeight)
+    ///     relative to R/G/B, so decoder-level alpha noise can't drive the
+    ///     score on its own the way full-weight alpha could.
+    ///   - Take the 95th percentile across cells, not the mean. A real edit
+    ///     (recolored costume, swapped region) lights up a cluster of cells
+    ///     hard, and that cluster survives into the top 5%; uniform
+    ///     low-magnitude codec noise sits in the bottom 95% and gets ignored
+    ///     regardless of how many cells it touches.
+    ///
+    /// Log the score for every texture (see TransplantMode) so the threshold
+    /// can be calibrated against real assets rather than guessed once and
+    /// trusted forever - note the threshold's scale/behavior under this
+    /// scorer differs from the old flat-mean one, so re-run --dry-run and
+    /// re-check the logged scores rather than reusing an old threshold value
+    /// unexamined.
+    /// </summary>
+    private const double kAlphaWeight = 0.25;
+
+    public static double Percentile95CellDifference(byte[] gridA, byte[] gridB, int gridSize)
+    {
+        if (gridA.Length != gridB.Length)
+            throw new ArgumentException("grids must be the same size to compare");
+
+        int cellCount = gridSize * gridSize;
+        int expected = checked(cellCount * 4);
+        if (gridA.Length != expected)
+            throw new ArgumentException(
+                $"grid length {gridA.Length} doesn't match gridSize {gridSize} (expected {expected})");
+
+        var cellScores = new double[cellCount];
+        for (int c = 0; c < cellCount; c++)
+        {
+            int i = c * 4;
+            double dr = Math.Abs(gridA[i + 0] - gridB[i + 0]);
+            double dg = Math.Abs(gridA[i + 1] - gridB[i + 1]);
+            double db = Math.Abs(gridA[i + 2] - gridB[i + 2]);
+            double da = Math.Abs(gridA[i + 3] - gridB[i + 3]);
+            cellScores[c] = (dr + dg + db + da * kAlphaWeight) / (3.0 + kAlphaWeight);
+        }
+
+        Array.Sort(cellScores);
+
+        // Nearest-rank method: the 95th-percentile element of a sorted
+        // ascending array of length N is at index ceil(0.95*N) - 1.
+        int rank = (int)Math.Ceiling(0.95 * cellCount) - 1;
+        rank = Math.Clamp(rank, 0, cellCount - 1);
+        return cellScores[rank];
+    }
 
     /// <summary>
     /// Bilinear-resamples an RGBA32 buffer to a new width/height. Used only
