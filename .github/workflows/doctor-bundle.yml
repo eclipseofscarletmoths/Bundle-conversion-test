@@ -31,15 +31,7 @@ permissions:
 jobs:
   doctor:
     runs-on: ubuntu-latest
-    # 20m wasn't a correctness bug - it was cutting off a legitimately slow
-    # but working run mid-texture. TransplantTextures decodes BOTH sides of
-    # every Texture2D pair fully to RGBA32, single-threaded, before it can
-    # diff them (see TransplantMode.cs) - large ASTC_RGBA_6x6/DXT5Crunched
-    # atlases (2048x2048) are the expensive ones, and each "not present in
-    # original" texture also pays a subprocess spawn via Etc2Encoder. None of
-    # that is parallelized yet, so give it real headroom rather than tuning
-    # this number to one specific bundle's texture count.
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -71,14 +63,11 @@ jobs:
             --pattern "input.bundle" \
             --output input.bundle
 
-      # original.bundle is now mandatory: BundleDoctor runs in `transplant`
-      # mode (diff + selective Texture2D/Sprite transplant against the known-
-      # good iOS bundle), and that mode has no meaningful fallback without an
-      # original to diff/rebuild from - unlike the old shader-restore pass,
-      # there's no degraded-but-safe path here. Fail the job outright rather
-      # than silently falling back to the legacy full-reencode pipeline (see
-      # doctor/BundleDoctorService.m - the client is confirmed to always
-      # upload this file, so its absence means something upstream broke).
+      # original.bundle is optional - the client only uploads it when
+      # UnityCacheLocator resolved a matching stock bundle on-device (see
+      # BundleDoctorService.m). `gh release download` exits non-zero when its
+      # --pattern matches nothing, so that failure is swallowed here and
+      # absence is just "no shader-restore pass this run", not a job failure.
       - name: Fetch original.bundle from the queue release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,20 +75,19 @@ jobs:
           gh release download "${{ inputs.release_tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "original.bundle" \
-            --output original.bundle
+            --output original.bundle || true
 
       - name: Run BundleDoctor
         env:
           OUTPUT_FORMAT: ${{ inputs.output_format }}
         run: |
           FORMAT="${OUTPUT_FORMAT:-RGBA32}"
-          # transplant's positional order is <original> <modded> <output>:
-          # original.bundle is the known-good iOS bundle we diff against and
-          # rebuild from, input.bundle (desktop-authored, from the queue
-          # release) is the modded side. --new-texture-format only governs
-          # brand-new textures with no counterpart in original - everything
-          # unchanged or re-encoded keeps original's own per-texture format.
-          dotnet build/BundleDoctor.dll transplant original.bundle input.bundle output.bundle --new-texture-format "$FORMAT"
+          if [ -f original.bundle ]; then
+            dotnet build/BundleDoctor.dll input.bundle output.bundle --original original.bundle "$FORMAT"
+          else
+            echo "No original.bundle on this release - running without shader restore."
+            dotnet build/BundleDoctor.dll input.bundle output.bundle "$FORMAT"
+          fi
 
       - name: Upload output.bundle back onto the same release
         env:
