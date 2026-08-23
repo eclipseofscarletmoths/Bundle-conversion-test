@@ -24,19 +24,34 @@
 //   - Texture2D   : NOT a raw byte copy - the modded bundle's Texture2D
 //                   objects are desktop-formatted (RGB24/DXT1/DXT5/
 //                   DXT5Crunched typically) and the original's are iOS-
-//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2). Every
-//                   Texture2D that exists in both is decoded on both sides to
-//                   plain RGBA32 and compared with TextureCodec's dimension-
-//                   agnostic downsample-and-diff (see that file) - encoding
-//                   differences and resolution differences alone should not
-//                   trigger a re-encode, only an actual difference in what's
-//                   painted on the texture should. Only textures that come
-//                   back "changed" pay the decode+resample+re-encode cost;
-//                   everything else is left completely byte-for-byte alone.
-//                   This is the resource saving the mod author asked for -
-//                   hundreds of material-referenced textures no longer all
-//                   get re-encoded on every doctor run, only the handful that
-//                   actually changed.
+//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2), so a
+//                   changed texture still needs a real decode+resample+
+//                   re-encode pass. Which textures NEED that pass is decided
+//                   by a cheap structural signal instead of a pixel diff: a
+//                   Texture2D the mod pipeline never touched stays streamed
+//                   out to the bundle's companion .resS exactly like the
+//                   original build shipped it, so its own serialized
+//                   AssetFileInfo.ByteSize sits at a couple hundred bytes -
+//                   just the m_StreamData pointer, no pixels. A Texture2D the
+//                   mod DID replace gets its raw pixel bytes serialized
+//                   directly into the object (no .resS round trip), which
+//                   pushes that same ByteSize into the hundreds-of-KB+ range.
+//                   That gap - confirmed via UABEA byte-size inspection
+//                   across real modded/original dumps - is readable straight
+//                   off AssetFileInfo before any typetree parse, decode, or
+//                   pixel comparison, so only the (small) inlined subset ever
+//                   pays the decode+resample+re-encode cost; everything still
+//                   streamed is left completely byte-for-byte alone. This
+//                   replaces an earlier pixel-content diff (decode both sides
+//                   to RGBA32, downsample to a grid, score the difference)
+//                   that was both the actual runtime bottleneck - the
+//                   original/iOS-side ASTC decode has no SIMD path - and a
+//                   source of its own false-positive/false-negative
+//                   headaches trying to separate "real edit" from cross-codec
+//                   quantization noise. The inline-vs-streamed signal sidesteps
+//                   both problems: it's a property of how the mod pipeline
+//                   itself serializes a replaced texture, not an inference
+//                   drawn from comparing pixels.
 //
 // Matching key: PathId within same-named SerializedFile, exactly like
 // Program.cs's existing Shader-restore pass already relies on (same build
@@ -62,46 +77,28 @@ using AssetsTools.NET.Texture;
 
 internal static class TransplantMode
 {
-    // Downsample grid used for the dimension-agnostic Texture2D content
-    // compare. 48x48 is generous enough to catch a recolored region or a
-    // swapped costume without being so fine-grained that ASTC/DXT block-
-    // rounding noise starts to dominate the score.
-    private const int DefaultGridSize = 48;
-
-    // 95th-percentile cell-difference threshold (0-255 scale, see
-    // TextureCodec.Percentile95CellDifference) above which a texture is
-    // treated as genuinely changed rather than just re-compressed/re-sized
-    // codec noise. This scorer looks at the top 5% of grid cells rather than
-    // the whole-grid mean, so it stays low for uniform cross-codec
-    // quantization noise and only spikes when a real edit clusters heavy
-    // differences in a region of the texture. Deliberately exposed via
-    // --threshold rather than hardcoded, since the right value depends on
-    // how aggressively the two builds' compressors round color - run once
-    // with --dry-run and read the logged score for every texture before
-    // trusting a threshold on a real transplant. This default is a starting
-    // point, not carried over from the old mean-based scorer - the two
-    // scorers are on different scales, so recalibrate against your own
-    // --dry-run output rather than assuming 4.0 still means the same thing.
-    private const double DefaultThreshold = 4.0;
-
-    // A cell only counts as "hot" once its own difference is well past
-    // ordinary quantization drift between codecs - 20.0 is deliberately
-    // higher than the old flat Percentile95 threshold, since this number is
-    // no longer trying to reject noise on its own; ChangedAreaFraction below
-    // does that job by also requiring the hot cells to cover real area.
-    private const double DefaultCellMagnitudeThreshold = 20.0;
-
-    // Fraction of the 48x48 grid that must be "hot" before a texture counts
-    // as genuinely changed - i.e. a real amount of surface area, not just a
-    // thin cluster along an edge/outline where cross-codec quantization bias
-    // concentrates. 0.02 = ~2% of cells (roughly 46 of 2304 on the default
-    // grid), which a stray edge-noise cluster along an icon's outline won't
-    // reach but an actual recolored region/swapped costume comfortably will.
-    // Like DefaultThreshold, this is a starting point - use --dry-run and
-    // read the logged area/magnitude numbers before trusting it on real assets.
-    private const double DefaultMinChangedAreaFraction = 0.02;
-
     private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
+
+    // A streamed (untouched) Texture2D only carries its m_StreamData pointer
+    // inline - a few hundred bytes of header/metadata, the actual pixels
+    // living in the bundle's companion .resS, entirely outside this object's
+    // own byte range. A Texture2D the mod pipeline actually replaced gets its
+    // raw pixel bytes serialized directly INTO the object (no .resS round
+    // trip), which is what pushes AssetFileInfo.ByteSize up into the
+    // hundreds-of-KB/multi-MB range. That gap is enormous - confirmed via
+    // UABEA byte-size inspection across real modded/original dumps - and is
+    // readable straight off AssetFileInfo before any typetree parse or
+    // FillPictureData call, so it lets Phase 1 skip the decode+diff pipeline
+    // entirely for every texture the mod never touched, instead of paying a
+    // full original-side ASTC decode (pure C#, no SIMD - the actual cost
+    // behind multi-minute-per-texture stalls on textures with no mip chain
+    // to slice from) just to conclude "unchanged" like today. 8KB sits
+    // comfortably above the ~200-300 byte streamed footprint and comfortably
+    // below any real inlined pixel payload, but this is a starting point:
+    // run --dry-run first and check the logged skip count/sizes against
+    // what UABEA shows for your own bundle before trusting it on a real
+    // transplant.
+    private const long DefaultInlineByteSizeThreshold = 8192;
 
     private sealed class Options
     {
@@ -109,11 +106,9 @@ internal static class TransplantMode
         public string ModdedPath = "";
         public string OutputPath = "";
         public string? TpkPath;
-        public double Threshold = DefaultThreshold;
-        public double CellMagnitudeThreshold = DefaultCellMagnitudeThreshold;
-        public double MinChangedAreaFraction = DefaultMinChangedAreaFraction;
         public bool DryRun;
         public int NewTextureFormat = DefaultNewTextureFormat;
+        public long InlineByteSizeThreshold = DefaultInlineByteSizeThreshold;
     }
 
     public static int Run(string[] modeArgs)
@@ -123,14 +118,13 @@ internal static class TransplantMode
         {
             Console.Error.WriteLine(
                 "usage: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> " +
-                "[--cell-threshold N] [--min-changed-area FRACTION] [--dry-run] " +
+                "[--inline-size-threshold BYTES] [--dry-run] " +
                 "[--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 
         Console.WriteLine(
-            $"[config] cell-threshold={opt.CellMagnitudeThreshold:F2} " +
-            $"min-changed-area={opt.MinChangedAreaFraction:P1} dry-run={opt.DryRun} " +
+            $"[config] inline-size-threshold={opt.InlineByteSizeThreshold:N0}B dry-run={opt.DryRun} " +
             $"new-texture-format={TextureCodec.FormatName(opt.NewTextureFormat)}");
 
         var originalManager = new AssetsManager();
@@ -344,9 +338,13 @@ internal static class TransplantMode
     }
 
     // One modded Texture2D's worth of state, threaded through the three
-    // phases below. Populated sequentially (Phase 1), decoded/diffed/
+    // phases below. Populated sequentially (Phase 1), decoded/resampled/
     // re-encoded in parallel (Phase 2), then applied+logged sequentially
-    // (Phase 3).
+    // (Phase 3). Every item that makes it into the work list has already
+    // been decided as needing a re-encode by the inline-size heuristic in
+    // Phase 1 - there's no further "is it actually changed" judgment call
+    // left to make on pixel content, so there's no Changed/score field here
+    // the way there used to be.
     private sealed class TextureWorkItem
     {
         public string TexName = "";
@@ -358,21 +356,27 @@ internal static class TransplantMode
         public bool HasOriginal;
         public AssetFileInfo? OrigInfo;
         public AssetTypeValueField? OrigBase;
-        public int OrigFormat, OrigWidth, OrigHeight, OrigMipCount;
-        public byte[]? OrigEncoded;
+        public int OrigFormat, OrigWidth, OrigHeight;
 
         public bool PathIdCollision;
         public Exception? Error;
 
         // Filled in by Phase 2.
-        public bool Changed;
-        public double P95;
-        public double AreaFraction;
         public byte[]? FinalEncoded;
     }
 
-    // --- Texture2D pass: decode both sides to RGBA32, diff ignoring dimensions,
-    // only re-encode what's actually changed ---------------------------------
+    // --- Texture2D pass -------------------------------------------------------
+    //
+    // Which textures need re-encoding is decided by the inline-size
+    // heuristic in Phase 1, before any pixel is ever touched (see this
+    // file's header comment). There is no pixel-content diff anywhere in
+    // this pass anymore - it was both the actual runtime bottleneck (the
+    // original/iOS-side ASTC decode has no SIMD path) and unreliable at
+    // telling "modder recolored this" apart from ordinary cross-codec
+    // quantization noise. Everything that reaches Phase 2 is presumed
+    // genuinely changed and gets decoded+resampled+re-encoded unconditionally;
+    // everything else was already filtered out in Phase 1 and never allocates
+    // a work item at all.
     //
     // Three phases, split specifically along the "touches the shared
     // AssetsManager/file-stream" line vs. "pure in-memory compute" line:
@@ -383,21 +387,18 @@ internal static class TransplantMode
     //   from multiple threads would race on that position and risk silently
     //   corrupt reads, not just a crash. So all field/byte extraction stays
     //   single-threaded here. It's comparatively cheap I/O, not the
-    //   expensive part.
+    //   expensive part. This is also where the inline-size pre-filter runs,
+    //   which means the vast majority of textures never reach GetBaseField
+    //   at all.
     //
-    //   Phase 2 (parallel) - decode to RGBA32, downsample+diff, and (only
-    //   for changed/new textures) resample+re-encode. This is pure
-    //   in-memory compute over each item's own already-extracted buffers -
-    //   no shared AssetsManager/file-stream access - so it's safe to fan
-    //   out across cores. This is the phase that used to run one texture at
-    //   a time and is what made a bundle with a few hundred large
-    //   ASTC/DXT5Crunched atlases take 18+ minutes and blow past the job
-    //   timeout. Per-texture progress is logged HERE, as each item
-    //   finishes, not deferred to Phase 3 - Console.WriteLine/Error are
-    //   internally synchronized, so concurrent lines never garble, they can
-    //   just print out of enumeration order. Deferring all logging to
-    //   Phase 3 was tried first and made large bundles look hung: nothing
-    //   printed until the entire file's texture batch finished decoding.
+    //   Phase 2 (parallel) - decode the modded side to RGBA32, resample to
+    //   the original's dimensions, re-encode into the original's format.
+    //   This is pure in-memory compute over each item's own already-
+    //   extracted buffers - no shared AssetsManager/file-stream access - so
+    //   it's safe to fan out across cores. Per-texture progress is logged
+    //   HERE, as each item finishes, not deferred to Phase 3 -
+    //   Console.WriteLine/Error are internally synchronized, so concurrent
+    //   lines never garble, they can just print out of enumeration order.
     //
     //   Phase 3 (sequential) - apply the results back onto the shared
     //   AssetsFile/AssetFileInfo state; mutation has to be ordered/single-
@@ -419,11 +420,11 @@ internal static class TransplantMode
         AssetsFile moddedAf = moddedAfileInst.file;
 
         // Diagnostic-only counters, so a slow run tells us WHERE the time
-        // actually went instead of guessing again. Interlocked/Stopwatch.
-        // GetTimestamp() because Phase 2 runs in Parallel.ForEach - a plain
-        // `long +=` would race and lose increments across threads.
-        long origDiffTicks = 0, moddedDecodeTicks = 0, encodeTicks = 0;
-        int noMipOrigCount = 0, slicedOrigCount = 0;
+        // actually went instead of guessing again. Interlocked because
+        // Phase 2 runs in Parallel.ForEach - a plain `long +=` would race
+        // and lose increments across threads.
+        long moddedDecodeTicks = 0, encodeTicks = 0;
+        int skippedByInlineSizeHeuristic = 0;
 
         var origByPathId = new Dictionary<long, AssetFileInfo>();
         foreach (AssetFileInfo info in origAf.GetAssetsOfType(AssetClassID.Texture2D))
@@ -437,6 +438,27 @@ internal static class TransplantMode
         var items = new List<TextureWorkItem>();
         foreach (AssetFileInfo moddedInfo in moddedAf.GetAssetsOfType(AssetClassID.Texture2D))
         {
+            // Fast pre-filter, ahead of even GetBaseField: a Texture2D the mod
+            // never touched is still streamed the same way the original build
+            // shipped it, so its own serialized ByteSize stays at the tiny
+            // header/m_StreamData-pointer footprint (~200-300B). Only textures
+            // the mod pipeline actually replaced get their pixel bytes inlined
+            // into the object, which is what drives ByteSize up into the
+            // hundreds-of-KB+ range - see DefaultInlineByteSizeThreshold's
+            // comment. When a counterpart exists in original AND this modded
+            // object is still below that line, skip straight to "unchanged"
+            // without opening a base field, reading pixel bytes, or running
+            // the decoder at all. This is the actual bottleneck cut: the
+            // original-side ASTC decode this skips is what the Phase 2 timing
+            // comment below already identifies as the multi-minute cost on
+            // real runs, not the (cheap, native) modded-side decode.
+            if (origByPathId.ContainsKey(moddedInfo.PathId) && moddedInfo.ByteSize <= opt.InlineByteSizeThreshold)
+            {
+                skippedByInlineSizeHeuristic++;
+                unchanged++;
+                continue;
+            }
+
             AssetTypeValueField moddedBase = moddedManager.GetBaseField(moddedAfileInst, moddedInfo);
             var item = new TextureWorkItem
             {
@@ -457,6 +479,12 @@ internal static class TransplantMode
 
                 if (origByPathId.TryGetValue(moddedInfo.PathId, out AssetFileInfo? origInfo))
                 {
+                    // Only the original's format/dimensions are needed now -
+                    // the resample target and the format to re-encode into.
+                    // No original-side pixel read/decode at all: the
+                    // inline-size pre-filter above already established that
+                    // this texture was replaced, so there's nothing left to
+                    // diff against.
                     item.HasOriginal = true;
                     item.OrigInfo = origInfo;
                     AssetTypeValueField origBase = originalManager.GetBaseField(origAfileInst, origInfo);
@@ -464,10 +492,8 @@ internal static class TransplantMode
                     item.OrigFormat = origBase["m_TextureFormat"].AsInt;
                     item.OrigWidth = origBase["m_Width"].AsInt;
                     item.OrigHeight = origBase["m_Height"].AsInt;
-                    item.OrigMipCount = origBase["m_MipCount"].AsInt;
                     if (item.OrigWidth <= 0 || item.OrigHeight <= 0)
                         throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.OrigWidth}x{item.OrigHeight}");
-                    item.OrigEncoded = ExtractEncodedBytes(origAfileInst, origBase, item.TexName);
                 }
                 else if (usedPathIds.Contains(moddedInfo.PathId))
                 {
@@ -483,7 +509,7 @@ internal static class TransplantMode
             }
         }
 
-        // --- Phase 2: parallel decode/diff/encode -------------------------
+        // --- Phase 2: parallel decode/resample/encode ----------------------
         // Progress logging happens HERE, immediately as each texture
         // finishes, not batched into Phase 3 - Console.WriteLine/Error are
         // internally synchronized (System.IO.SyncTextWriter), so concurrent
@@ -515,83 +541,33 @@ internal static class TransplantMode
             {
                 if (item.HasOriginal)
                 {
-                    // Diff decode: pull the smallest original-side mip that's
-                    // still >= the grid size instead of the full base level.
-                    // The original bundle's textures are typically ASTC,
-                    // decoded by a pure-C# decoder with no native/SIMD path -
-                    // that decode, done at full resolution for every texture
-                    // just to feed a 48x48 diff grid, was the actual cost
-                    // behind 18-20+ minute runs, far more than the
-                    // now-parallelized Phase 2 loop itself. Falls back to a
-                    // full decode automatically (TryGetMipSlice returns
-                    // false) for formats whose mip chain isn't a simple
-                    // concatenation - i.e. never for the original/iOS side in
-                    // practice, since that's always ASTC/ETC2 per this file's
-                    // own header comment.
-                    var swOrig = System.Diagnostics.Stopwatch.StartNew();
-                    int diffLevel = TextureCodec.ChooseDiffMipLevel(
-                        item.OrigWidth, item.OrigHeight, item.OrigMipCount, DefaultGridSize);
-
-                    byte[] origGrid;
-                    if (TextureCodec.TryGetMipSlice(
-                            item.OrigEncoded!, item.OrigFormat, item.OrigWidth, item.OrigHeight,
-                            item.OrigMipCount, diffLevel,
-                            out byte[] origMipBytes, out int origMipW, out int origMipH))
-                    {
-                        Interlocked.Increment(ref slicedOrigCount);
-                        byte[] origMipRgba = TextureCodec.DecodeToRgba32(
-                            origMipBytes, origMipW, origMipH, item.OrigFormat, item.TexName);
-                        origGrid = TextureCodec.DownsampleToGrid(origMipRgba, origMipW, origMipH, DefaultGridSize);
-                    }
-                    else
-                    {
-                        if (item.OrigMipCount <= 1) Interlocked.Increment(ref noMipOrigCount);
-                        byte[] origRgbaFull = TextureCodec.DecodeToRgba32(
-                            item.OrigEncoded!, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
-                        origGrid = TextureCodec.DownsampleToGrid(origRgbaFull, item.OrigWidth, item.OrigHeight, DefaultGridSize);
-                    }
-                    swOrig.Stop();
-                    Interlocked.Add(ref origDiffTicks, swOrig.ElapsedTicks);
-
-                    // Modded (desktop) side stays a full decode - that's
-                    // Kyaru's native decoder (DXT/RGB24/RGBA32/Crunch), cheap
-                    // regardless of resolution, and the full-res pixels are
-                    // needed anyway below if this texture turns out changed.
+                    // Reached Phase 2 at all only because Phase 1's
+                    // inline-size heuristic already decided this texture was
+                    // replaced by the mod - no original-side decode, no
+                    // diff, no threshold to weigh. Decode the modded side,
+                    // resample to the original's own dimensions, re-encode
+                    // into the original's own format. Kyaru's native decoder
+                    // handles the modded (desktop) side - DXT/RGB24/RGBA32/
+                    // Crunch - cheap regardless of resolution.
                     var swModded = System.Diagnostics.Stopwatch.StartNew();
                     byte[] moddedRgba = TextureCodec.DecodeToRgba32(
                         item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
-                    byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, item.ModdedWidth, item.ModdedHeight, DefaultGridSize);
                     swModded.Stop();
                     Interlocked.Add(ref moddedDecodeTicks, swModded.ElapsedTicks);
 
-                    // Logged for calibration (see --dry-run guidance above) but no
-                    // longer the decision by itself: a single worst cell can't tell
-                    // "modder recolored this" apart from "quantization bias along
-                    // this texture's outline", since both look like a cluster of
-                    // elevated cells. areaFraction below requires the elevated
-                    // cells to also cover real surface area before calling it changed.
-                    item.P95 = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
-                    item.AreaFraction = TextureCodec.ChangedAreaFraction(
-                        origGrid, moddedGrid, DefaultGridSize, opt.CellMagnitudeThreshold);
-                    item.Changed = item.AreaFraction >= opt.MinChangedAreaFraction;
+                    var swEncode = System.Diagnostics.Stopwatch.StartNew();
+                    byte[] resampled = TextureCodec.ResampleBilinear(
+                        moddedRgba, item.ModdedWidth, item.ModdedHeight, item.OrigWidth, item.OrigHeight);
+                    item.FinalEncoded = TextureCodec.EncodeFromRgba32(
+                        resampled, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
+                    swEncode.Stop();
+                    Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
 
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: " +
                         $"orig {item.OrigWidth}x{item.OrigHeight} {TextureCodec.FormatName(item.OrigFormat)} vs " +
-                        $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)}, " +
-                        $"p95={item.P95:F2}, changed-area={item.AreaFraction:P1}" +
-                        (item.Changed ? " -> CHANGED" : " -> unchanged"));
-
-                    if (item.Changed)
-                    {
-                        var swEncode = System.Diagnostics.Stopwatch.StartNew();
-                        byte[] resampled = TextureCodec.ResampleBilinear(
-                            moddedRgba, item.ModdedWidth, item.ModdedHeight, item.OrigWidth, item.OrigHeight);
-                        item.FinalEncoded = TextureCodec.EncodeFromRgba32(
-                            resampled, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
-                        swEncode.Stop();
-                        Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
-                    }
+                        $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)} " +
+                        "-> inlined by mod, re-encoding.");
                 }
                 else
                 {
@@ -636,12 +612,6 @@ internal static class TransplantMode
 
             if (item.HasOriginal)
             {
-                if (!item.Changed)
-                {
-                    unchanged++;
-                    continue;
-                }
-
                 if (!opt.DryRun)
                 {
                     AssetTypeValueField origBase = item.OrigBase!;
@@ -685,17 +655,16 @@ internal static class TransplantMode
             }
         }
 
-        if (items.Count > 0)
+        if (items.Count > 0 || skippedByInlineSizeHeuristic > 0)
         {
-            double origDiffMs = origDiffTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double moddedMs = moddedDecodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             double encodeMs = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             Console.WriteLine(
                 $"[{fileName}] texture timing (summed across all threads, so this can exceed wall time by " +
-                $"~{maxParallelism}x): orig-side diff decode={origDiffMs:N0}ms ({slicedOrigCount} mip-sliced, " +
-                $"{noMipOrigCount} full-decode fallback - likely no mipmaps stored), modded-side decode=" +
-                $"{moddedMs:N0}ms, re-encode={encodeMs:N0}ms across {reencoded + addedNew} changed/new textures. " +
-                $"Parallelism cap: {maxParallelism} (set BUNDLEDOCTOR_MAX_PARALLELISM to override).");
+                $"~{maxParallelism}x): modded-side decode={moddedMs:N0}ms, re-encode={encodeMs:N0}ms across " +
+                $"{reencoded + addedNew} changed/new textures. {skippedByInlineSizeHeuristic} texture(s) never " +
+                $"decoded at all - still streamed (<= {opt.InlineByteSizeThreshold:N0}B, presumed untouched by " +
+                $"the mod). Parallelism cap: {maxParallelism} (set BUNDLEDOCTOR_MAX_PARALLELISM to override).");
         }
     }
 
@@ -822,40 +791,17 @@ internal static class TransplantMode
                 positional.RemoveAt(i);
                 i--;
             }
-            else if (string.Equals(positional[i], "--threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
-            {
-                // Deprecated: kept only so old scripts calling --threshold don't
-                // hard-fail. It no longer drives the decision (see --cell-threshold
-                // and --min-changed-area) - a single worst cell can't tell a real
-                // edit apart from clustered codec quantization noise on its own.
-                if (!double.TryParse(positional[i + 1], out double t))
-                    return null;
-                opt.Threshold = t;
-                Console.Error.WriteLine(
-                    "[warn] --threshold is deprecated and no longer affects the changed/unchanged " +
-                    "decision; use --cell-threshold and --min-changed-area instead.");
-                positional.RemoveRange(i, 2);
-                i--;
-            }
-            else if (string.Equals(positional[i], "--cell-threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
-            {
-                if (!double.TryParse(positional[i + 1], out double t))
-                    return null;
-                opt.CellMagnitudeThreshold = t;
-                positional.RemoveRange(i, 2);
-                i--;
-            }
-            else if (string.Equals(positional[i], "--min-changed-area", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
-            {
-                if (!double.TryParse(positional[i + 1], out double f))
-                    return null;
-                opt.MinChangedAreaFraction = f;
-                positional.RemoveRange(i, 2);
-                i--;
-            }
             else if (string.Equals(positional[i], "--new-texture-format", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
             {
                 opt.NewTextureFormat = ParseFormatName(positional[i + 1]);
+                positional.RemoveRange(i, 2);
+                i--;
+            }
+            else if (string.Equals(positional[i], "--inline-size-threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
+            {
+                if (!long.TryParse(positional[i + 1], out long b) || b < 0)
+                    return null;
+                opt.InlineByteSizeThreshold = b;
                 positional.RemoveRange(i, 2);
                 i--;
             }
