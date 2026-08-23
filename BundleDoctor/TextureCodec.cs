@@ -21,6 +21,7 @@
 //
 using System;
 using System.IO;
+using System.Threading;
 using AstcSharp;
 using AstcSharp.Core;
 using Texture2DDecoder;
@@ -87,7 +88,7 @@ internal static class TextureCodec
                 return DecodeKyaruDXT(encodedData, width, height, isDxt5: true);
 
             case FmtDXT5Crunched:
-                return DecodeKyaruDXT5Crunched(encodedData, width, height);
+                return DecodeKyaruDXT5CrunchedGuarded(encodedData, width, height, texName);
 
             case FmtETC2_RGB:
                 return DecodeKyaruETC2(encodedData, width, height, hasAlpha: false);
@@ -295,6 +296,85 @@ internal static class TextureCodec
             throw new InvalidDataException($"Kyaru Texture2DDecoder failed to decode {(isDxt5 ? "DXT5" : "DXT1")}");
 
         return BgraToRgba(bgra);
+    }
+
+    // --- crunch decode isolation ---------------------------------------------
+    //
+    // Kyaru's UnpackUnityCrunch (the native Texture2DDecoder crunch/CRN
+    // decompressor this calls into) has a public history of fatal native
+    // crashes on certain crunch bitstreams (see e.g. AssetRipper#81), and can
+    // apparently also just never return on some inputs rather than crash or
+    // throw - a silent hang inside unmanaged code that .NET has no clean way
+    // to cancel once it's started. Inside Parallel.ForEach, a single stuck
+    // call like that permanently occupies one worker slot forever - on a
+    // 2-vCPU CI runner that's HALF your parallelism gone silently, with
+    // nothing logged for that texture because the call that would produce
+    // the log line never returns. That reads from the outside as "the whole
+    // job is unbearably slow", not as an obvious failure.
+    //
+    // Two defenses, both belt-and-braces given unmanaged code can't be
+    // force-cancelled from managed .NET:
+    //   - Serialize every crunch decode behind CrunchDecodeGate. If the hang
+    //     is actually a reentrancy/thread-safety bug in the underlying CRN
+    //     decoder (many crunch/CRN implementations lazily precompute shared
+    //     Huffman tables with no synchronization - a classic source of
+    //     exactly this kind of bug under concurrent first-use), never
+    //     calling it from two threads at once fixes it outright.
+    //   - Run the actual call on its own dedicated background thread and
+    //     only wait up to CrunchDecodeTimeoutMs. If it doesn't return in
+    //     time, give up on it (it's IsBackground so it can't block process
+    //     exit, and the thread just leaks quietly for the rest of the run)
+    //     and throw, so THIS texture is skipped via the normal item.Error
+    //     path instead of the whole batch hanging until CI's job timeout
+    //     kills it wholesale. The gate is deliberately never released once a
+    //     call times out, so every later crunched texture in the run fails
+    //     Monitor.TryEnter immediately instead of each queuing up to wait the
+    //     full timeout again behind an abandoned call that will never finish.
+    private static readonly object CrunchDecodeGate = new object();
+    private const int CrunchDecodeTimeoutMs = 20_000;
+
+    private static byte[] DecodeKyaruDXT5CrunchedGuarded(byte[] encodedData, int width, int height, string texName)
+    {
+        if (!Monitor.TryEnter(CrunchDecodeGate, CrunchDecodeTimeoutMs))
+        {
+            throw new TimeoutException(
+                $"'{texName}': DXT5Crunched decode gate was still held after {CrunchDecodeTimeoutMs}ms - " +
+                "an earlier crunched texture in this run appears to have hung inside the native decoder " +
+                "rather than crashed or returned; skipping this texture rather than waiting on it indefinitely.");
+        }
+
+        byte[]? result = null;
+        Exception? workerException = null;
+
+        var worker = new Thread(() =>
+        {
+            try { result = DecodeKyaruDXT5Crunched(encodedData, width, height); }
+            catch (Exception ex) { workerException = ex; }
+        })
+        {
+            IsBackground = true,
+            Name = "CrunchDecodeWorker"
+        };
+        worker.Start();
+
+        if (!worker.Join(CrunchDecodeTimeoutMs))
+        {
+            // Deliberately NOT Monitor.Exit here - see class comment above.
+            // The abandoned worker thread may still be sitting in the native
+            // call; we're not waiting on it any further, and every later
+            // crunched texture should fail fast rather than queue up behind it.
+            throw new TimeoutException(
+                $"'{texName}': DXT5Crunched decode did not return within {CrunchDecodeTimeoutMs}ms - " +
+                "treating it as hung rather than waiting indefinitely. Every remaining DXT5Crunched " +
+                "texture in this run will now be skipped too (see this message) until the process restarts.");
+        }
+
+        Monitor.Exit(CrunchDecodeGate);
+
+        if (workerException != null)
+            throw workerException;
+
+        return result ?? throw new InvalidDataException($"'{texName}': DXT5Crunched decode returned no data");
     }
 
     private static byte[] DecodeKyaruDXT5Crunched(byte[] encodedData, int width, int height)
