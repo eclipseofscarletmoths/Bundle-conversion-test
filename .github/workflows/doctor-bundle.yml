@@ -67,10 +67,7 @@ jobs:
       # UnityCacheLocator resolved a matching stock bundle on-device (see
       # BundleDoctorService.m). `gh release download` exits non-zero when its
       # --pattern matches nothing, so that failure is swallowed here and
-      # absence now means "no baseline to diff against" - the run step below
-      # falls back to the full desktop->iOS convert pipeline entirely rather
-      # than running transplant, since transplant has nothing to compare
-      # against or transplant into without an original.
+      # absence is just "no shader-restore pass this run", not a job failure.
       - name: Fetch original.bundle from the queue release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,18 +83,9 @@ jobs:
         run: |
           FORMAT="${OUTPUT_FORMAT:-RGBA32}"
           if [ -f original.bundle ]; then
-            # transplant needs a known-good original to diff against and
-            # transplant into - that's the whole point of the mode, so it's
-            # only reachable when UnityCacheLocator actually resolved one.
-            # $FORMAT here targets EVERY texture this pass actually
-            # re-encodes (changed existing ones and brand-new ones alike) -
-            # unchanged textures are left untouched in their original
-            # (often smaller/ASTC) format regardless of $FORMAT.
-            dotnet build/BundleDoctor.dll transplant original.bundle input.bundle output.bundle \
-              --output-format "$FORMAT"
+            dotnet build/BundleDoctor.dll input.bundle output.bundle --original original.bundle "$FORMAT"
           else
-            echo "No original.bundle on this release - nothing to diff/transplant against, " \
-                 "falling back to full desktop->iOS convert."
+            echo "No original.bundle on this release - running without shader restore."
             dotnet build/BundleDoctor.dll input.bundle output.bundle "$FORMAT"
           fi
 
