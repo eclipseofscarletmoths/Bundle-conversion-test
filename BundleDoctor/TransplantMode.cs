@@ -54,6 +54,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
@@ -417,6 +418,13 @@ internal static class TransplantMode
         AssetsFile origAf = origAfileInst.file;
         AssetsFile moddedAf = moddedAfileInst.file;
 
+        // Diagnostic-only counters, so a slow run tells us WHERE the time
+        // actually went instead of guessing again. Interlocked/Stopwatch.
+        // GetTimestamp() because Phase 2 runs in Parallel.ForEach - a plain
+        // `long +=` would race and lose increments across threads.
+        long origDiffTicks = 0, moddedDecodeTicks = 0, encodeTicks = 0;
+        int noMipOrigCount = 0, slicedOrigCount = 0;
+
         var origByPathId = new Dictionary<long, AssetFileInfo>();
         foreach (AssetFileInfo info in origAf.GetAssetsOfType(AssetClassID.Texture2D))
             origByPathId[info.PathId] = info;
@@ -484,7 +492,21 @@ internal static class TransplantMode
         // textures may print out of their original enumeration order, which
         // is a fair trade for not going silent on a large bundle for
         // however long the whole batch takes.
-        Parallel.ForEach(items, item =>
+        // Explicit rather than relying on Parallel.ForEach's default (which is
+        // already ~= ProcessorCount, so this changes nothing today) - mainly
+        // so BUNDLEDOCTOR_MAX_PARALLELISM is available to force this down to
+        // 1 for an apples-to-apples timing comparison against the parallel
+        // path, without needing a rebuild. On the CI runner this actually
+        // matters (ubuntu-latest is a 2 vCPU box - see doctor-bundle.yml),
+        // so more Task-level parallelism than that just adds scheduling
+        // overhead, it doesn't add throughput.
+        int maxParallelism = Environment.ProcessorCount;
+        string? dopOverride = Environment.GetEnvironmentVariable("BUNDLEDOCTOR_MAX_PARALLELISM");
+        if (!string.IsNullOrWhiteSpace(dopOverride) && int.TryParse(dopOverride, out int dop) && dop > 0)
+            maxParallelism = dop;
+        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+
+        Parallel.ForEach(items, parallelOptions, item =>
         {
             if (item.Error != null || item.PathIdCollision)
                 return;
@@ -506,6 +528,7 @@ internal static class TransplantMode
                     // concatenation - i.e. never for the original/iOS side in
                     // practice, since that's always ASTC/ETC2 per this file's
                     // own header comment.
+                    var swOrig = System.Diagnostics.Stopwatch.StartNew();
                     int diffLevel = TextureCodec.ChooseDiffMipLevel(
                         item.OrigWidth, item.OrigHeight, item.OrigMipCount, DefaultGridSize);
 
@@ -515,24 +538,31 @@ internal static class TransplantMode
                             item.OrigMipCount, diffLevel,
                             out byte[] origMipBytes, out int origMipW, out int origMipH))
                     {
+                        Interlocked.Increment(ref slicedOrigCount);
                         byte[] origMipRgba = TextureCodec.DecodeToRgba32(
                             origMipBytes, origMipW, origMipH, item.OrigFormat, item.TexName);
                         origGrid = TextureCodec.DownsampleToGrid(origMipRgba, origMipW, origMipH, DefaultGridSize);
                     }
                     else
                     {
+                        if (item.OrigMipCount <= 1) Interlocked.Increment(ref noMipOrigCount);
                         byte[] origRgbaFull = TextureCodec.DecodeToRgba32(
                             item.OrigEncoded!, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
                         origGrid = TextureCodec.DownsampleToGrid(origRgbaFull, item.OrigWidth, item.OrigHeight, DefaultGridSize);
                     }
+                    swOrig.Stop();
+                    Interlocked.Add(ref origDiffTicks, swOrig.ElapsedTicks);
 
                     // Modded (desktop) side stays a full decode - that's
                     // Kyaru's native decoder (DXT/RGB24/RGBA32/Crunch), cheap
                     // regardless of resolution, and the full-res pixels are
                     // needed anyway below if this texture turns out changed.
+                    var swModded = System.Diagnostics.Stopwatch.StartNew();
                     byte[] moddedRgba = TextureCodec.DecodeToRgba32(
                         item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
                     byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, item.ModdedWidth, item.ModdedHeight, DefaultGridSize);
+                    swModded.Stop();
+                    Interlocked.Add(ref moddedDecodeTicks, swModded.ElapsedTicks);
 
                     // Logged for calibration (see --dry-run guidance above) but no
                     // longer the decision by itself: a single worst cell can't tell
@@ -554,10 +584,13 @@ internal static class TransplantMode
 
                     if (item.Changed)
                     {
+                        var swEncode = System.Diagnostics.Stopwatch.StartNew();
                         byte[] resampled = TextureCodec.ResampleBilinear(
                             moddedRgba, item.ModdedWidth, item.ModdedHeight, item.OrigWidth, item.OrigHeight);
                         item.FinalEncoded = TextureCodec.EncodeFromRgba32(
                             resampled, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
+                        swEncode.Stop();
+                        Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
                     }
                 }
                 else
@@ -567,10 +600,13 @@ internal static class TransplantMode
                     // inserts it as a brand new object using the SAME baseField
                     // already read from modded (correct field layout for this Unity
                     // build), just with the format/image-data fields swapped.
+                    var swEncode = System.Diagnostics.Stopwatch.StartNew();
                     byte[] moddedRgba = TextureCodec.DecodeToRgba32(
                         item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
                     item.FinalEncoded = TextureCodec.EncodeFromRgba32(
                         moddedRgba, item.ModdedWidth, item.ModdedHeight, opt.NewTextureFormat, item.TexName);
+                    swEncode.Stop();
+                    Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
 
                     Console.WriteLine(
                         $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: not present in original - " +
@@ -647,6 +683,19 @@ internal static class TransplantMode
                 addedNew++;
                 fileTouched = true;
             }
+        }
+
+        if (items.Count > 0)
+        {
+            double origDiffMs = origDiffTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double moddedMs = moddedDecodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double encodeMs = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            Console.WriteLine(
+                $"[{fileName}] texture timing (summed across all threads, so this can exceed wall time by " +
+                $"~{maxParallelism}x): orig-side diff decode={origDiffMs:N0}ms ({slicedOrigCount} mip-sliced, " +
+                $"{noMipOrigCount} full-decode fallback - likely no mipmaps stored), modded-side decode=" +
+                $"{moddedMs:N0}ms, re-encode={encodeMs:N0}ms across {reencoded + addedNew} changed/new textures. " +
+                $"Parallelism cap: {maxParallelism} (set BUNDLEDOCTOR_MAX_PARALLELISM to override).");
         }
     }
 
