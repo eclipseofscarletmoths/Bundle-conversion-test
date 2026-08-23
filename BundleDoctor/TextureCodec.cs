@@ -143,6 +143,124 @@ internal static class TextureCodec
         }
     }
 
+    // --- mip-chain slicing for cheap diffing ---------------------------------
+    //
+    // Unity's raw picture data for a texture with mipmaps is the base level
+    // (mip 0, full resolution) followed by each successively smaller mip,
+    // concatenated largest-to-smallest (this is the same layout Texture2D.
+    // GetRawTextureData/LoadRawTextureData document for the managed side, and
+    // it's what every raw Unity texture extractor - UABE, AssetStudio, etc. -
+    // assumes). For a block-compressed format, each mip's byte size is
+    // ceil(w/blockDim) * ceil(h/blockDim) * bytesPerBlock; for an uncompressed
+    // format it's w*h*bytesPerPixel. Mip N's pixel dimensions are
+    // max(1, baseDim >> N).
+    //
+    // This lets us decode a SMALL mip instead of the full-resolution base
+    // level when all we want is the downsampled diff grid - the 48x48 grid
+    // this project diffs against throws away all but ~0.1% of a full decode's
+    // pixels anyway for a typical atlas, and the ASTC decoder in particular
+    // (AstcSharp, pure C#, no SIMD) pays for every one of those discarded
+    // pixels. Not supported for DXT5Crunched: crunch's own container format
+    // doesn't lay out mips as simple concatenated raw blocks, so crunched
+    // textures still decode at full resolution (this only matters for the
+    // desktop/modded side, which is cheap - native Kyaru decode - regardless).
+    private static bool IsSliceableFormat(int format) => format switch
+    {
+        FmtRGB24 or FmtRGBA32 or FmtDXT1 or FmtDXT5 or
+        FmtETC2_RGB or FmtETC2_RGBA8 or
+        FmtASTC_RGBA_4x4 or FmtASTC_RGBA_6x6 or FmtASTC_RGBA_8x8 => true,
+        _ => false
+    };
+
+    private static (int blockDim, int bytesPerBlock) BlockLayout(int format) => format switch
+    {
+        FmtRGB24 => (1, 3),
+        FmtRGBA32 => (1, 4),
+        FmtDXT1 => (4, 8),
+        FmtDXT5 => (4, 16),
+        FmtETC2_RGB => (4, 8),
+        FmtETC2_RGBA8 => (4, 16),
+        FmtASTC_RGBA_4x4 => (4, 16),
+        FmtASTC_RGBA_6x6 => (6, 16),
+        FmtASTC_RGBA_8x8 => (8, 16),
+        _ => throw new NotSupportedException($"no mip block layout for format {format}")
+    };
+
+    private static int MipByteSize(int format, int width, int height)
+    {
+        var (blockDim, bytesPerBlock) = BlockLayout(format);
+        if (blockDim == 1)
+            return checked(width * height * bytesPerBlock);
+
+        int blocksX = (width + blockDim - 1) / blockDim;
+        int blocksY = (height + blockDim - 1) / blockDim;
+        return checked(blocksX * blocksY * bytesPerBlock);
+    }
+
+    private static (int width, int height) MipDimensions(int baseWidth, int baseHeight, int level) =>
+        (Math.Max(1, baseWidth >> level), Math.Max(1, baseHeight >> level));
+
+    /// <summary>
+    /// Picks the smallest mip level (deepest into the chain, i.e. cheapest to
+    /// decode) whose dimensions are still >= gridSize in both axes - anything
+    /// smaller than the diff grid itself would just be upsampled noise for no
+    /// benefit. Falls back to level 0 (the base image) if the texture has no
+    /// mips, or if even the first mip drops below gridSize (small icon-sized
+    /// textures - decoding the base level for those was already cheap).
+    /// </summary>
+    public static int ChooseDiffMipLevel(int baseWidth, int baseHeight, int mipCount, int gridSize)
+    {
+        int chosen = 0;
+        for (int level = 1; level < mipCount; level++)
+        {
+            (int w, int h) = MipDimensions(baseWidth, baseHeight, level);
+            if (w < gridSize || h < gridSize)
+                break;
+            chosen = level;
+        }
+        return chosen;
+    }
+
+    /// <summary>
+    /// Attempts to slice a single mip level's encoded bytes out of a full
+    /// mip-chain picture-data blob without decoding anything. Returns false
+    /// (rather than throwing) for formats whose mip chain isn't a simple
+    /// concatenation of raw blocks (currently just DXT5Crunched) or if the
+    /// blob turns out shorter than the requested level's math implies - the
+    /// caller should fall back to decoding the full base level in that case.
+    /// </summary>
+    public static bool TryGetMipSlice(
+        byte[] pictureData, int format, int baseWidth, int baseHeight, int mipCount, int mipLevel,
+        out byte[] mipBytes, out int mipWidth, out int mipHeight)
+    {
+        mipBytes = Array.Empty<byte>();
+        mipWidth = mipHeight = 0;
+
+        if (!IsSliceableFormat(format) || mipLevel < 0 || mipLevel >= Math.Max(1, mipCount))
+            return false;
+
+        int offset = 0;
+        for (int level = 0; level < mipLevel; level++)
+        {
+            (int w, int h) = MipDimensions(baseWidth, baseHeight, level);
+            offset += MipByteSize(format, w, h);
+        }
+
+        (int mw, int mh) = MipDimensions(baseWidth, baseHeight, mipLevel);
+        int size = MipByteSize(format, mw, mh);
+
+        if (offset < 0 || size < 0 || offset + size > pictureData.Length)
+            return false; // mip chain shorter than expected - fall back to full decode
+
+        var slice = new byte[size];
+        Buffer.BlockCopy(pictureData, offset, slice, 0, size);
+
+        mipBytes = slice;
+        mipWidth = mw;
+        mipHeight = mh;
+        return true;
+    }
+
     // --- decode backends ----------------------------------------------------
 
     private static byte[] DecodeRGB24(byte[] data, int width, int height)

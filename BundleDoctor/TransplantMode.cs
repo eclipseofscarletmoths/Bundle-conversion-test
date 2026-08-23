@@ -357,7 +357,7 @@ internal static class TransplantMode
         public bool HasOriginal;
         public AssetFileInfo? OrigInfo;
         public AssetTypeValueField? OrigBase;
-        public int OrigFormat, OrigWidth, OrigHeight;
+        public int OrigFormat, OrigWidth, OrigHeight, OrigMipCount;
         public byte[]? OrigEncoded;
 
         public bool PathIdCollision;
@@ -456,6 +456,7 @@ internal static class TransplantMode
                     item.OrigFormat = origBase["m_TextureFormat"].AsInt;
                     item.OrigWidth = origBase["m_Width"].AsInt;
                     item.OrigHeight = origBase["m_Height"].AsInt;
+                    item.OrigMipCount = origBase["m_MipCount"].AsInt;
                     if (item.OrigWidth <= 0 || item.OrigHeight <= 0)
                         throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.OrigWidth}x{item.OrigHeight}");
                     item.OrigEncoded = ExtractEncodedBytes(origAfileInst, origBase, item.TexName);
@@ -492,12 +493,45 @@ internal static class TransplantMode
             {
                 if (item.HasOriginal)
                 {
-                    byte[] origRgba = TextureCodec.DecodeToRgba32(
-                        item.OrigEncoded!, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
+                    // Diff decode: pull the smallest original-side mip that's
+                    // still >= the grid size instead of the full base level.
+                    // The original bundle's textures are typically ASTC,
+                    // decoded by a pure-C# decoder with no native/SIMD path -
+                    // that decode, done at full resolution for every texture
+                    // just to feed a 48x48 diff grid, was the actual cost
+                    // behind 18-20+ minute runs, far more than the
+                    // now-parallelized Phase 2 loop itself. Falls back to a
+                    // full decode automatically (TryGetMipSlice returns
+                    // false) for formats whose mip chain isn't a simple
+                    // concatenation - i.e. never for the original/iOS side in
+                    // practice, since that's always ASTC/ETC2 per this file's
+                    // own header comment.
+                    int diffLevel = TextureCodec.ChooseDiffMipLevel(
+                        item.OrigWidth, item.OrigHeight, item.OrigMipCount, DefaultGridSize);
+
+                    byte[] origGrid;
+                    if (TextureCodec.TryGetMipSlice(
+                            item.OrigEncoded!, item.OrigFormat, item.OrigWidth, item.OrigHeight,
+                            item.OrigMipCount, diffLevel,
+                            out byte[] origMipBytes, out int origMipW, out int origMipH))
+                    {
+                        byte[] origMipRgba = TextureCodec.DecodeToRgba32(
+                            origMipBytes, origMipW, origMipH, item.OrigFormat, item.TexName);
+                        origGrid = TextureCodec.DownsampleToGrid(origMipRgba, origMipW, origMipH, DefaultGridSize);
+                    }
+                    else
+                    {
+                        byte[] origRgbaFull = TextureCodec.DecodeToRgba32(
+                            item.OrigEncoded!, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
+                        origGrid = TextureCodec.DownsampleToGrid(origRgbaFull, item.OrigWidth, item.OrigHeight, DefaultGridSize);
+                    }
+
+                    // Modded (desktop) side stays a full decode - that's
+                    // Kyaru's native decoder (DXT/RGB24/RGBA32/Crunch), cheap
+                    // regardless of resolution, and the full-res pixels are
+                    // needed anyway below if this texture turns out changed.
                     byte[] moddedRgba = TextureCodec.DecodeToRgba32(
                         item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
-
-                    byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, item.OrigWidth, item.OrigHeight, DefaultGridSize);
                     byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, item.ModdedWidth, item.ModdedHeight, DefaultGridSize);
 
                     // Logged for calibration (see --dry-run guidance above) but no
