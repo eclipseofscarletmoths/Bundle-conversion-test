@@ -31,7 +31,15 @@ permissions:
 jobs:
   doctor:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20m wasn't a correctness bug - it was cutting off a legitimately slow
+    # but working run mid-texture. TransplantTextures decodes BOTH sides of
+    # every Texture2D pair fully to RGBA32, single-threaded, before it can
+    # diff them (see TransplantMode.cs) - large ASTC_RGBA_6x6/DXT5Crunched
+    # atlases (2048x2048) are the expensive ones, and each "not present in
+    # original" texture also pays a subprocess spawn via Etc2Encoder. None of
+    # that is parallelized yet, so give it real headroom rather than tuning
+    # this number to one specific bundle's texture count.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

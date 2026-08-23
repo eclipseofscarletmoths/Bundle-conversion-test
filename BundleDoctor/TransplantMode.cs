@@ -54,6 +54,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using AssetsTools.NET.Texture;
@@ -341,8 +342,63 @@ internal static class TransplantMode
         }
     }
 
+    // One modded Texture2D's worth of state, threaded through the three
+    // phases below. Populated sequentially (Phase 1), decoded/diffed/
+    // re-encoded in parallel (Phase 2), then applied+logged sequentially
+    // (Phase 3).
+    private sealed class TextureWorkItem
+    {
+        public string TexName = "";
+        public long PathId;
+        public AssetTypeValueField ModdedBase = null!;
+        public int ModdedFormat, ModdedWidth, ModdedHeight;
+        public byte[]? ModdedEncoded;
+
+        public bool HasOriginal;
+        public AssetFileInfo? OrigInfo;
+        public AssetTypeValueField? OrigBase;
+        public int OrigFormat, OrigWidth, OrigHeight;
+        public byte[]? OrigEncoded;
+
+        public bool PathIdCollision;
+        public Exception? Error;
+
+        // Filled in by Phase 2.
+        public bool Changed;
+        public double P95;
+        public double AreaFraction;
+        public byte[]? FinalEncoded;
+    }
+
     // --- Texture2D pass: decode both sides to RGBA32, diff ignoring dimensions,
     // only re-encode what's actually changed ---------------------------------
+    //
+    // Three phases, split specifically along the "touches the shared
+    // AssetsManager/file-stream" line vs. "pure in-memory compute" line:
+    //
+    //   Phase 1 (sequential) - GetBaseField and FillPictureData both read
+    //   through AssetsFileInstance's underlying reader/stream position,
+    //   which is shared per-instance state - calling these concurrently
+    //   from multiple threads would race on that position and risk silently
+    //   corrupt reads, not just a crash. So all field/byte extraction stays
+    //   single-threaded here. It's comparatively cheap I/O, not the
+    //   expensive part.
+    //
+    //   Phase 2 (parallel) - decode to RGBA32, downsample+diff, and (only
+    //   for changed/new textures) resample+re-encode. This is pure
+    //   in-memory compute over each item's own already-extracted buffers -
+    //   no shared AssetsManager/file-stream access - so it's safe to fan
+    //   out across cores. This is the phase that used to run one texture at
+    //   a time and is what made a bundle with a few hundred large
+    //   ASTC/DXT5Crunched atlases take 18+ minutes and blow past the job
+    //   timeout. Logging is deliberately NOT done in this phase - writing
+    //   to Console concurrently from multiple threads interleaves output
+    //   into garbage.
+    //
+    //   Phase 3 (sequential) - apply the results back onto the shared
+    //   AssetsFile/AssetFileInfo state (mutation has to be ordered/single-
+    //   threaded regardless), and log in the same per-texture order as
+    //   before so the run's console output reads the same way it always has.
     private static void TransplantTextures(
         AssetsManager originalManager,
         AssetsManager moddedManager,
@@ -367,30 +423,69 @@ internal static class TransplantMode
         foreach (AssetFileInfo info in origAf.Metadata.AssetInfos)
             usedPathIds.Add(info.PathId);
 
+        // --- Phase 1: sequential extraction -----------------------------
+        var items = new List<TextureWorkItem>();
         foreach (AssetFileInfo moddedInfo in moddedAf.GetAssetsOfType(AssetClassID.Texture2D))
         {
             AssetTypeValueField moddedBase = moddedManager.GetBaseField(moddedAfileInst, moddedInfo);
-            string texName = moddedBase["m_Name"].AsString;
+            var item = new TextureWorkItem
+            {
+                TexName = moddedBase["m_Name"].AsString,
+                PathId = moddedInfo.PathId,
+                ModdedBase = moddedBase,
+            };
+            items.Add(item);
 
             try
             {
+                item.ModdedFormat = moddedBase["m_TextureFormat"].AsInt;
+                item.ModdedWidth = moddedBase["m_Width"].AsInt;
+                item.ModdedHeight = moddedBase["m_Height"].AsInt;
+                if (item.ModdedWidth <= 0 || item.ModdedHeight <= 0)
+                    throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.ModdedWidth}x{item.ModdedHeight}");
+                item.ModdedEncoded = ExtractEncodedBytes(moddedAfileInst, moddedBase, item.TexName);
+
                 if (origByPathId.TryGetValue(moddedInfo.PathId, out AssetFileInfo? origInfo))
                 {
+                    item.HasOriginal = true;
+                    item.OrigInfo = origInfo;
                     AssetTypeValueField origBase = originalManager.GetBaseField(origAfileInst, origInfo);
+                    item.OrigBase = origBase;
+                    item.OrigFormat = origBase["m_TextureFormat"].AsInt;
+                    item.OrigWidth = origBase["m_Width"].AsInt;
+                    item.OrigHeight = origBase["m_Height"].AsInt;
+                    if (item.OrigWidth <= 0 || item.OrigHeight <= 0)
+                        throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.OrigWidth}x{item.OrigHeight}");
+                    item.OrigEncoded = ExtractEncodedBytes(origAfileInst, origBase, item.TexName);
+                }
+                else if (usedPathIds.Contains(moddedInfo.PathId))
+                {
+                    item.PathIdCollision = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                item.Error = ex;
+            }
+        }
 
-                    int origFormat = origBase["m_TextureFormat"].AsInt;
-                    int origWidth = origBase["m_Width"].AsInt;
-                    int origHeight = origBase["m_Height"].AsInt;
+        // --- Phase 2: parallel decode/diff/encode ------------------------
+        Parallel.ForEach(items, item =>
+        {
+            if (item.Error != null || item.PathIdCollision)
+                return;
 
-                    int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
-                    int moddedWidth = moddedBase["m_Width"].AsInt;
-                    int moddedHeight = moddedBase["m_Height"].AsInt;
+            try
+            {
+                if (item.HasOriginal)
+                {
+                    byte[] origRgba = TextureCodec.DecodeToRgba32(
+                        item.OrigEncoded!, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
+                    byte[] moddedRgba = TextureCodec.DecodeToRgba32(
+                        item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
 
-                    byte[] origRgba = DecodeTextureRgba32(origAfileInst, origBase, origFormat, origWidth, origHeight, texName);
-                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
-
-                    byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, origWidth, origHeight, DefaultGridSize);
-                    byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, moddedWidth, moddedHeight, DefaultGridSize);
+                    byte[] origGrid = TextureCodec.DownsampleToGrid(origRgba, item.OrigWidth, item.OrigHeight, DefaultGridSize);
+                    byte[] moddedGrid = TextureCodec.DownsampleToGrid(moddedRgba, item.ModdedWidth, item.ModdedHeight, DefaultGridSize);
 
                     // Logged for calibration (see --dry-run guidance above) but no
                     // longer the decision by itself: a single worst cell can't tell
@@ -398,116 +493,131 @@ internal static class TransplantMode
                     // this texture's outline", since both look like a cluster of
                     // elevated cells. areaFraction below requires the elevated
                     // cells to also cover real surface area before calling it changed.
-                    double p95 = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
-                    double areaFraction = TextureCodec.ChangedAreaFraction(
+                    item.P95 = TextureCodec.Percentile95CellDifference(origGrid, moddedGrid, DefaultGridSize);
+                    item.AreaFraction = TextureCodec.ChangedAreaFraction(
                         origGrid, moddedGrid, DefaultGridSize, opt.CellMagnitudeThreshold);
-                    bool changed = areaFraction >= opt.MinChangedAreaFraction;
+                    item.Changed = item.AreaFraction >= opt.MinChangedAreaFraction;
 
-                    Console.WriteLine(
-                        $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: " +
-                        $"orig {origWidth}x{origHeight} {TextureCodec.FormatName(origFormat)} vs " +
-                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, " +
-                        $"p95={p95:F2}, changed-area={areaFraction:P1}" +
-                        (changed ? " -> CHANGED" : " -> unchanged"));
-
-                    if (!changed)
+                    if (item.Changed)
                     {
-                        unchanged++;
-                        continue;
+                        byte[] resampled = TextureCodec.ResampleBilinear(
+                            moddedRgba, item.ModdedWidth, item.ModdedHeight, item.OrigWidth, item.OrigHeight);
+                        item.FinalEncoded = TextureCodec.EncodeFromRgba32(
+                            resampled, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
                     }
-
-                    byte[] resampled = TextureCodec.ResampleBilinear(moddedRgba, moddedWidth, moddedHeight, origWidth, origHeight);
-                    byte[] encoded = TextureCodec.EncodeFromRgba32(resampled, origWidth, origHeight, origFormat, texName);
-
-                    if (!opt.DryRun)
-                    {
-                        origBase["m_TextureFormat"].AsInt = origFormat; // unchanged - keep original's own format
-                        origBase["m_MipCount"].AsInt = 1;
-                        origBase["m_CompleteImageSize"].AsInt = encoded.Length;
-
-                        AssetTypeValueField streamData = origBase["m_StreamData"];
-                        streamData["offset"].AsULong = 0;
-                        streamData["size"].AsInt = 0;
-                        streamData["path"].AsString = string.Empty;
-                        origBase["image data"].AsByteArray = encoded;
-
-                        origInfo.SetNewData(origBase);
-                    }
-                    reencoded++;
-                    fileTouched = true;
                 }
                 else
                 {
-                    if (usedPathIds.Contains(moddedInfo.PathId))
-                    {
-                        Console.WriteLine(
-                            $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId} not present in " +
-                            "original as a Texture2D, but that PathId is already used by a different object - skipping.");
-                        skippedErrors++;
-                        continue;
-                    }
-
                     // No counterpart at all: decode the modded texture and encode it
-                    // fresh into the configured default new-texture format, then
-                    // insert it as a brand new object using the SAME baseField we
+                    // fresh into the configured default new-texture format; Phase 3
+                    // inserts it as a brand new object using the SAME baseField
                     // already read from modded (correct field layout for this Unity
-                    // build), just with the format/image-data fields swapped - the
-                    // same in-place mutation the "changed" branch above does, only
-                    // targeting a newly created AssetFileInfo in orig instead of an
-                    // existing one.
-                    int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
-                    int moddedWidth = moddedBase["m_Width"].AsInt;
-                    int moddedHeight = moddedBase["m_Height"].AsInt;
-
-                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
-                    byte[] encoded = TextureCodec.EncodeFromRgba32(moddedRgba, moddedWidth, moddedHeight, opt.NewTextureFormat, texName);
-
-                    Console.WriteLine(
-                        $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: not present in original - " +
-                        $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({moddedWidth}x{moddedHeight}).");
-
-                    if (!opt.DryRun)
-                    {
-                        moddedBase["m_TextureFormat"].AsInt = opt.NewTextureFormat;
-                        moddedBase["m_MipCount"].AsInt = 1;
-                        moddedBase["m_CompleteImageSize"].AsInt = encoded.Length;
-
-                        AssetTypeValueField streamData = moddedBase["m_StreamData"];
-                        streamData["offset"].AsULong = 0;
-                        streamData["size"].AsInt = 0;
-                        streamData["path"].AsString = string.Empty;
-                        moddedBase["image data"].AsByteArray = encoded;
-
-                        var newInfo = AssetFileInfo.Create(origAf, moddedInfo.PathId, (int)AssetClassID.Texture2D);
-                        newInfo.SetNewData(moddedBase);
-                        origAf.Metadata.AddAssetInfo(newInfo);
-                        usedPathIds.Add(moddedInfo.PathId);
-                    }
-                    addedNew++;
-                    fileTouched = true;
+                    // build), just with the format/image-data fields swapped.
+                    byte[] moddedRgba = TextureCodec.DecodeToRgba32(
+                        item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
+                    item.FinalEncoded = TextureCodec.EncodeFromRgba32(
+                        moddedRgba, item.ModdedWidth, item.ModdedHeight, opt.NewTextureFormat, item.TexName);
                 }
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine(
-                    $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: skipped due to error - " +
-                    $"{ex.GetType().Name}: {ex.Message}");
+                item.Error = ex;
+            }
+        });
+
+        // --- Phase 3: sequential apply + log ------------------------------
+        foreach (TextureWorkItem item in items)
+        {
+            if (item.PathIdCollision)
+            {
+                Console.WriteLine(
+                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId} not present in " +
+                    "original as a Texture2D, but that PathId is already used by a different object - skipping.");
                 skippedErrors++;
+                continue;
+            }
+
+            if (item.Error != null)
+            {
+                Console.Error.WriteLine(
+                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: skipped due to error - " +
+                    $"{item.Error.GetType().Name}: {item.Error.Message}");
+                skippedErrors++;
+                continue;
+            }
+
+            if (item.HasOriginal)
+            {
+                Console.WriteLine(
+                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: " +
+                    $"orig {item.OrigWidth}x{item.OrigHeight} {TextureCodec.FormatName(item.OrigFormat)} vs " +
+                    $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)}, " +
+                    $"p95={item.P95:F2}, changed-area={item.AreaFraction:P1}" +
+                    (item.Changed ? " -> CHANGED" : " -> unchanged"));
+
+                if (!item.Changed)
+                {
+                    unchanged++;
+                    continue;
+                }
+
+                if (!opt.DryRun)
+                {
+                    AssetTypeValueField origBase = item.OrigBase!;
+                    origBase["m_TextureFormat"].AsInt = item.OrigFormat; // unchanged - keep original's own format
+                    origBase["m_MipCount"].AsInt = 1;
+                    origBase["m_CompleteImageSize"].AsInt = item.FinalEncoded!.Length;
+
+                    AssetTypeValueField streamData = origBase["m_StreamData"];
+                    streamData["offset"].AsULong = 0;
+                    streamData["size"].AsInt = 0;
+                    streamData["path"].AsString = string.Empty;
+                    origBase["image data"].AsByteArray = item.FinalEncoded;
+
+                    item.OrigInfo!.SetNewData(origBase);
+                }
+                reencoded++;
+                fileTouched = true;
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: not present in original - " +
+                    $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({item.ModdedWidth}x{item.ModdedHeight}).");
+
+                if (!opt.DryRun)
+                {
+                    AssetTypeValueField moddedBase = item.ModdedBase;
+                    moddedBase["m_TextureFormat"].AsInt = opt.NewTextureFormat;
+                    moddedBase["m_MipCount"].AsInt = 1;
+                    moddedBase["m_CompleteImageSize"].AsInt = item.FinalEncoded!.Length;
+
+                    AssetTypeValueField streamData = moddedBase["m_StreamData"];
+                    streamData["offset"].AsULong = 0;
+                    streamData["size"].AsInt = 0;
+                    streamData["path"].AsString = string.Empty;
+                    moddedBase["image data"].AsByteArray = item.FinalEncoded;
+
+                    var newInfo = AssetFileInfo.Create(origAf, item.PathId, (int)AssetClassID.Texture2D);
+                    newInfo.SetNewData(moddedBase);
+                    origAf.Metadata.AddAssetInfo(newInfo);
+                    usedPathIds.Add(item.PathId);
+                }
+                addedNew++;
+                fileTouched = true;
             }
         }
     }
 
-    private static byte[] DecodeTextureRgba32(
-        AssetsFileInstance afileInst, AssetTypeValueField baseField, int format, int width, int height, string texName)
+    // Sequential-only: reads through AssetsFileInstance's shared reader/
+    // stream position (TextureFile.ReadTextureFile + FillPictureData), so
+    // this must stay in Phase 1, never called from the parallel Phase 2.
+    private static byte[] ExtractEncodedBytes(
+        AssetsFileInstance afileInst, AssetTypeValueField baseField, string texName)
     {
-        if (width <= 0 || height <= 0)
-            throw new InvalidDataException($"invalid dimensions for '{texName}': {width}x{height}");
-
         TextureFile tf = TextureFile.ReadTextureFile(baseField);
-        byte[] encodedData = tf.FillPictureData(afileInst)
+        return tf.FillPictureData(afileInst)
             ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
-
-        return TextureCodec.DecodeToRgba32(encodedData, width, height, format, texName);
     }
 
     // --- shared plumbing -----------------------------------------------------
