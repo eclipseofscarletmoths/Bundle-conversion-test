@@ -24,34 +24,27 @@
 //   - Texture2D   : NOT a raw byte copy - the modded bundle's Texture2D
 //                   objects are desktop-formatted (RGB24/DXT1/DXT5/
 //                   DXT5Crunched typically) and the original's are iOS-
-//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2), so a
-//                   changed texture still needs a real decode+resample+
-//                   re-encode pass. Which textures NEED that pass is decided
-//                   by a cheap structural signal instead of a pixel diff: a
-//                   Texture2D the mod pipeline never touched stays streamed
-//                   out to the bundle's companion .resS exactly like the
-//                   original build shipped it, so its own serialized
-//                   AssetFileInfo.ByteSize sits at a couple hundred bytes -
-//                   just the m_StreamData pointer, no pixels. A Texture2D the
-//                   mod DID replace gets its raw pixel bytes serialized
-//                   directly into the object (no .resS round trip), which
-//                   pushes that same ByteSize into the hundreds-of-KB+ range.
-//                   That gap - confirmed via UABEA byte-size inspection
-//                   across real modded/original dumps - is readable straight
-//                   off AssetFileInfo before any typetree parse, decode, or
-//                   pixel comparison, so only the (small) inlined subset ever
-//                   pays the decode+resample+re-encode cost; everything still
-//                   streamed is left completely byte-for-byte alone. This
-//                   replaces an earlier pixel-content diff (decode both sides
-//                   to RGBA32, downsample to a grid, score the difference)
-//                   that was both the actual runtime bottleneck - the
-//                   original/iOS-side ASTC decode has no SIMD path - and a
-//                   source of its own false-positive/false-negative
-//                   headaches trying to separate "real edit" from cross-codec
-//                   quantization noise. The inline-vs-streamed signal sidesteps
-//                   both problems: it's a property of how the mod pipeline
-//                   itself serializes a replaced texture, not an inference
-//                   drawn from comparing pixels.
+//                   formatted (typically ASTC 4x4/6x6, sometimes ETC2).
+//                   Deciding which of these actually needs re-encoding used
+//                   to mean decoding both sides to RGBA32 and running a
+//                   dimension-agnostic pixel diff - correct, but expensive
+//                   enough (2 min -> 20+ min on a full bundle) that it wasn't
+//                   worth it: stock bundles stream every Texture2D's image
+//                   data out to a companion .resS file (m_StreamData has a
+//                   non-empty path, and the object's own serialized size
+//                   stays in the low hundreds of bytes), while modding tools
+//                   like UABEA write a replaced texture's image data straight
+//                   back INLINE into the object (m_StreamData.path goes
+//                   empty, and the object's own serialized size balloons into
+//                   the tens-of-millions-of-bytes range). That inline-vs-
+//                   streamed state is itself the signal a mod touched a given
+//                   texture - no pixel decode needed to find out. Only inline
+//                   modded textures (plus any Texture2D absent from original
+//                   entirely) pay the decode+resample+re-encode cost;
+//                   everything still streamed exactly like original is left
+//                   completely byte-for-byte alone and isn't even decoded.
+//                   See TransplantTextures's comment below for the one
+//                   fallback case (both sides inline) this doesn't cover.
 //
 // Matching key: PathId within same-named SerializedFile, exactly like
 // Program.cs's existing Shader-restore pass already relies on (same build
@@ -69,8 +62,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra;
 using AssetsTools.NET.Texture;
@@ -78,27 +69,6 @@ using AssetsTools.NET.Texture;
 internal static class TransplantMode
 {
     private const int DefaultNewTextureFormat = TextureCodec.FmtASTC_RGBA_4x4;
-
-    // A streamed (untouched) Texture2D only carries its m_StreamData pointer
-    // inline - a few hundred bytes of header/metadata, the actual pixels
-    // living in the bundle's companion .resS, entirely outside this object's
-    // own byte range. A Texture2D the mod pipeline actually replaced gets its
-    // raw pixel bytes serialized directly INTO the object (no .resS round
-    // trip), which is what pushes AssetFileInfo.ByteSize up into the
-    // hundreds-of-KB/multi-MB range. That gap is enormous - confirmed via
-    // UABEA byte-size inspection across real modded/original dumps - and is
-    // readable straight off AssetFileInfo before any typetree parse or
-    // FillPictureData call, so it lets Phase 1 skip the decode+diff pipeline
-    // entirely for every texture the mod never touched, instead of paying a
-    // full original-side ASTC decode (pure C#, no SIMD - the actual cost
-    // behind multi-minute-per-texture stalls on textures with no mip chain
-    // to slice from) just to conclude "unchanged" like today. 8KB sits
-    // comfortably above the ~200-300 byte streamed footprint and comfortably
-    // below any real inlined pixel payload, but this is a starting point:
-    // run --dry-run first and check the logged skip count/sizes against
-    // what UABEA shows for your own bundle before trusting it on a real
-    // transplant.
-    private const long DefaultInlineByteSizeThreshold = 8192;
 
     private sealed class Options
     {
@@ -108,7 +78,6 @@ internal static class TransplantMode
         public string? TpkPath;
         public bool DryRun;
         public int NewTextureFormat = DefaultNewTextureFormat;
-        public long InlineByteSizeThreshold = DefaultInlineByteSizeThreshold;
     }
 
     public static int Run(string[] modeArgs)
@@ -118,13 +87,12 @@ internal static class TransplantMode
         {
             Console.Error.WriteLine(
                 "usage: BundleDoctor transplant <original.bundle> <modded.bundle> <output.bundle> " +
-                "[--inline-size-threshold BYTES] [--dry-run] " +
-                "[--new-texture-format FMT] [classdata.tpk]");
+                "[--dry-run] [--new-texture-format FMT] [classdata.tpk]");
             return 2;
         }
 
         Console.WriteLine(
-            $"[config] inline-size-threshold={opt.InlineByteSizeThreshold:N0}B dry-run={opt.DryRun} " +
+            $"[config] dry-run={opt.DryRun} " +
             $"new-texture-format={TextureCodec.FormatName(opt.NewTextureFormat)}");
 
         var originalManager = new AssetsManager();
@@ -337,72 +305,8 @@ internal static class TransplantMode
         }
     }
 
-    // One modded Texture2D's worth of state, threaded through the three
-    // phases below. Populated sequentially (Phase 1), decoded/resampled/
-    // re-encoded in parallel (Phase 2), then applied+logged sequentially
-    // (Phase 3). Every item that makes it into the work list has already
-    // been decided as needing a re-encode by the inline-size heuristic in
-    // Phase 1 - there's no further "is it actually changed" judgment call
-    // left to make on pixel content, so there's no Changed/score field here
-    // the way there used to be.
-    private sealed class TextureWorkItem
-    {
-        public string TexName = "";
-        public long PathId;
-        public AssetTypeValueField ModdedBase = null!;
-        public int ModdedFormat, ModdedWidth, ModdedHeight;
-        public byte[]? ModdedEncoded;
-
-        public bool HasOriginal;
-        public AssetFileInfo? OrigInfo;
-        public AssetTypeValueField? OrigBase;
-        public int OrigFormat, OrigWidth, OrigHeight;
-
-        public bool PathIdCollision;
-        public Exception? Error;
-
-        // Filled in by Phase 2.
-        public byte[]? FinalEncoded;
-    }
-
-    // --- Texture2D pass -------------------------------------------------------
-    //
-    // Which textures need re-encoding is decided by the inline-size
-    // heuristic in Phase 1, before any pixel is ever touched (see this
-    // file's header comment). There is no pixel-content diff anywhere in
-    // this pass anymore - it was both the actual runtime bottleneck (the
-    // original/iOS-side ASTC decode has no SIMD path) and unreliable at
-    // telling "modder recolored this" apart from ordinary cross-codec
-    // quantization noise. Everything that reaches Phase 2 is presumed
-    // genuinely changed and gets decoded+resampled+re-encoded unconditionally;
-    // everything else was already filtered out in Phase 1 and never allocates
-    // a work item at all.
-    //
-    // Three phases, split specifically along the "touches the shared
-    // AssetsManager/file-stream" line vs. "pure in-memory compute" line:
-    //
-    //   Phase 1 (sequential) - GetBaseField and FillPictureData both read
-    //   through AssetsFileInstance's underlying reader/stream position,
-    //   which is shared per-instance state - calling these concurrently
-    //   from multiple threads would race on that position and risk silently
-    //   corrupt reads, not just a crash. So all field/byte extraction stays
-    //   single-threaded here. It's comparatively cheap I/O, not the
-    //   expensive part. This is also where the inline-size pre-filter runs,
-    //   which means the vast majority of textures never reach GetBaseField
-    //   at all.
-    //
-    //   Phase 2 (parallel) - decode the modded side to RGBA32, resample to
-    //   the original's dimensions, re-encode into the original's format.
-    //   This is pure in-memory compute over each item's own already-
-    //   extracted buffers - no shared AssetsManager/file-stream access - so
-    //   it's safe to fan out across cores. Per-texture progress is logged
-    //   HERE, as each item finishes, not deferred to Phase 3 -
-    //   Console.WriteLine/Error are internally synchronized, so concurrent
-    //   lines never garble, they can just print out of enumeration order.
-    //
-    //   Phase 3 (sequential) - apply the results back onto the shared
-    //   AssetsFile/AssetFileInfo state; mutation has to be ordered/single-
-    //   threaded regardless of when logging happens.
+    // --- Texture2D pass: decode both sides to RGBA32, diff ignoring dimensions,
+    // only re-encode what's actually changed ---------------------------------
     private static void TransplantTextures(
         AssetsManager originalManager,
         AssetsManager moddedManager,
@@ -419,13 +323,6 @@ internal static class TransplantMode
         AssetsFile origAf = origAfileInst.file;
         AssetsFile moddedAf = moddedAfileInst.file;
 
-        // Diagnostic-only counters, so a slow run tells us WHERE the time
-        // actually went instead of guessing again. Interlocked because
-        // Phase 2 runs in Parallel.ForEach - a plain `long +=` would race
-        // and lose increments across threads.
-        long moddedDecodeTicks = 0, encodeTicks = 0;
-        int skippedByInlineSizeHeuristic = 0;
-
         var origByPathId = new Dictionary<long, AssetFileInfo>();
         foreach (AssetFileInfo info in origAf.GetAssetsOfType(AssetClassID.Texture2D))
             origByPathId[info.PathId] = info;
@@ -434,249 +331,181 @@ internal static class TransplantMode
         foreach (AssetFileInfo info in origAf.Metadata.AssetInfos)
             usedPathIds.Add(info.PathId);
 
-        // --- Phase 1: sequential extraction -----------------------------
-        var items = new List<TextureWorkItem>();
         foreach (AssetFileInfo moddedInfo in moddedAf.GetAssetsOfType(AssetClassID.Texture2D))
         {
-            // Fast pre-filter, ahead of even GetBaseField: a Texture2D the mod
-            // never touched is still streamed the same way the original build
-            // shipped it, so its own serialized ByteSize stays at the tiny
-            // header/m_StreamData-pointer footprint (~200-300B). Only textures
-            // the mod pipeline actually replaced get their pixel bytes inlined
-            // into the object, which is what drives ByteSize up into the
-            // hundreds-of-KB+ range - see DefaultInlineByteSizeThreshold's
-            // comment. When a counterpart exists in original AND this modded
-            // object is still below that line, skip straight to "unchanged"
-            // without opening a base field, reading pixel bytes, or running
-            // the decoder at all. This is the actual bottleneck cut: the
-            // original-side ASTC decode this skips is what the Phase 2 timing
-            // comment below already identifies as the multi-minute cost on
-            // real runs, not the (cheap, native) modded-side decode.
-            if (origByPathId.ContainsKey(moddedInfo.PathId) && moddedInfo.ByteSize <= opt.InlineByteSizeThreshold)
-            {
-                skippedByInlineSizeHeuristic++;
-                unchanged++;
-                continue;
-            }
-
             AssetTypeValueField moddedBase = moddedManager.GetBaseField(moddedAfileInst, moddedInfo);
-            var item = new TextureWorkItem
-            {
-                TexName = moddedBase["m_Name"].AsString,
-                PathId = moddedInfo.PathId,
-                ModdedBase = moddedBase,
-            };
-            items.Add(item);
+            string texName = moddedBase["m_Name"].AsString;
 
             try
             {
-                item.ModdedFormat = moddedBase["m_TextureFormat"].AsInt;
-                item.ModdedWidth = moddedBase["m_Width"].AsInt;
-                item.ModdedHeight = moddedBase["m_Height"].AsInt;
-                if (item.ModdedWidth <= 0 || item.ModdedHeight <= 0)
-                    throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.ModdedWidth}x{item.ModdedHeight}");
-                item.ModdedEncoded = ExtractEncodedBytes(moddedAfileInst, moddedBase, item.TexName);
-
                 if (origByPathId.TryGetValue(moddedInfo.PathId, out AssetFileInfo? origInfo))
                 {
-                    // Only the original's format/dimensions are needed now -
-                    // the resample target and the format to re-encode into.
-                    // No original-side pixel read/decode at all: the
-                    // inline-size pre-filter above already established that
-                    // this texture was replaced, so there's nothing left to
-                    // diff against.
-                    item.HasOriginal = true;
-                    item.OrigInfo = origInfo;
                     AssetTypeValueField origBase = originalManager.GetBaseField(origAfileInst, origInfo);
-                    item.OrigBase = origBase;
-                    item.OrigFormat = origBase["m_TextureFormat"].AsInt;
-                    item.OrigWidth = origBase["m_Width"].AsInt;
-                    item.OrigHeight = origBase["m_Height"].AsInt;
-                    if (item.OrigWidth <= 0 || item.OrigHeight <= 0)
-                        throw new InvalidDataException($"invalid dimensions for '{item.TexName}': {item.OrigWidth}x{item.OrigHeight}");
-                }
-                else if (usedPathIds.Contains(moddedInfo.PathId))
-                {
-                    item.PathIdCollision = true;
-                    Console.WriteLine(
-                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId} not present in " +
-                        "original as a Texture2D, but that PathId is already used by a different object - skipping.");
-                }
-            }
-            catch (Exception ex)
-            {
-                item.Error = ex;
-            }
-        }
 
-        // --- Phase 2: parallel decode/resample/encode ----------------------
-        // Progress logging happens HERE, immediately as each texture
-        // finishes, not batched into Phase 3 - Console.WriteLine/Error are
-        // internally synchronized (System.IO.SyncTextWriter), so concurrent
-        // calls from multiple threads never interleave mid-line into
-        // garbled output; the only observable effect is that completed
-        // textures may print out of their original enumeration order, which
-        // is a fair trade for not going silent on a large bundle for
-        // however long the whole batch takes.
-        // Explicit rather than relying on Parallel.ForEach's default (which is
-        // already ~= ProcessorCount, so this changes nothing today) - mainly
-        // so BUNDLEDOCTOR_MAX_PARALLELISM is available to force this down to
-        // 1 for an apples-to-apples timing comparison against the parallel
-        // path, without needing a rebuild. On the CI runner this actually
-        // matters (ubuntu-latest is a 2 vCPU box - see doctor-bundle.yml),
-        // so more Task-level parallelism than that just adds scheduling
-        // overhead, it doesn't add throughput.
-        int maxParallelism = Environment.ProcessorCount;
-        string? dopOverride = Environment.GetEnvironmentVariable("BUNDLEDOCTOR_MAX_PARALLELISM");
-        if (!string.IsNullOrWhiteSpace(dopOverride) && int.TryParse(dopOverride, out int dop) && dop > 0)
-            maxParallelism = dop;
-        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+                    int origFormat = origBase["m_TextureFormat"].AsInt;
+                    int origWidth = origBase["m_Width"].AsInt;
+                    int origHeight = origBase["m_Height"].AsInt;
 
-        Parallel.ForEach(items, parallelOptions, item =>
-        {
-            if (item.Error != null || item.PathIdCollision)
-                return;
+                    // Inline-vs-streamed check (see header comment above) -
+                    // cheap field reads only, no decode. This is what makes
+                    // the common "mod didn't touch this texture" case free:
+                    // both sides streaming to .resS the normal way never
+                    // even reaches a decode call.
+                    bool origStreamed = !string.IsNullOrEmpty(origBase["m_StreamData"]["path"].AsString);
+                    bool moddedStreamed = !string.IsNullOrEmpty(moddedBase["m_StreamData"]["path"].AsString);
 
-            try
-            {
-                if (item.HasOriginal)
-                {
-                    // Reached Phase 2 at all only because Phase 1's
-                    // inline-size heuristic already decided this texture was
-                    // replaced by the mod - no original-side decode, no
-                    // diff, no threshold to weigh. Decode the modded side,
-                    // resample to the original's own dimensions, re-encode
-                    // into the original's own format. Kyaru's native decoder
-                    // handles the modded (desktop) side - DXT/RGB24/RGBA32/
-                    // Crunch - cheap regardless of resolution.
-                    var swModded = System.Diagnostics.Stopwatch.StartNew();
-                    byte[] moddedRgba = TextureCodec.DecodeToRgba32(
-                        item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
-                    swModded.Stop();
-                    Interlocked.Add(ref moddedDecodeTicks, swModded.ElapsedTicks);
+                    bool changed;
+                    string reason;
 
-                    var swEncode = System.Diagnostics.Stopwatch.StartNew();
-                    byte[] resampled = TextureCodec.ResampleBilinear(
-                        moddedRgba, item.ModdedWidth, item.ModdedHeight, item.OrigWidth, item.OrigHeight);
-                    item.FinalEncoded = TextureCodec.EncodeFromRgba32(
-                        resampled, item.OrigWidth, item.OrigHeight, item.OrigFormat, item.TexName);
-                    swEncode.Stop();
-                    Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
+                    if (origStreamed && moddedStreamed)
+                    {
+                        // Both still stream to .resS normally - the mod
+                        // didn't touch this one.
+                        changed = false;
+                        reason = "both streamed";
+                    }
+                    else if (origStreamed && !moddedStreamed)
+                    {
+                        // The telltale sign: original streams this texture
+                        // like every other stock asset, but modded carries it
+                        // fully inline - UABEA's reimport signature, and a
+                        // reliable "this one was edited" flag on its own.
+                        changed = true;
+                        reason = "modded is inline, original is streamed";
+                    }
+                    else if (!origStreamed && !moddedStreamed)
+                    {
+                        // Both inline - happens for small textures (icons,
+                        // tiny UI elements) that never get streamed even in
+                        // the stock build, so inline-vs-streamed can't tell
+                        // us anything here. Fall back to a raw byte compare
+                        // of the two serialized objects - still far cheaper
+                        // than a pixel decode, and exact.
+                        byte[] origRaw = ReadRawBytes(origAf, origInfo);
+                        byte[] moddedRaw = ReadRawBytes(moddedAf, moddedInfo);
+                        changed = !BytesEqual(origRaw, moddedRaw);
+                        reason = "both inline, raw byte compare";
+                    }
+                    else
+                    {
+                        // Original inline, modded streamed - not a shape a
+                        // desktop mod authored from this same original should
+                        // ever produce. Treat conservatively as changed
+                        // rather than silently skip a case that wasn't
+                        // anticipated.
+                        changed = true;
+                        reason = "unexpected: original inline, modded streamed";
+                    }
+
+                    int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
+                    int moddedWidth = moddedBase["m_Width"].AsInt;
+                    int moddedHeight = moddedBase["m_Height"].AsInt;
 
                     Console.WriteLine(
-                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: " +
-                        $"orig {item.OrigWidth}x{item.OrigHeight} {TextureCodec.FormatName(item.OrigFormat)} vs " +
-                        $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)} " +
-                        "-> inlined by mod, re-encoding.");
+                        $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: " +
+                        $"orig {origWidth}x{origHeight} {TextureCodec.FormatName(origFormat)} vs " +
+                        $"modded {moddedWidth}x{moddedHeight} {TextureCodec.FormatName(moddedFormat)}, {reason}" +
+                        (changed ? " -> CHANGED" : " -> unchanged"));
+
+                    if (!changed)
+                    {
+                        unchanged++;
+                        continue;
+                    }
+
+                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
+                    byte[] resampled = TextureCodec.ResampleBilinear(moddedRgba, moddedWidth, moddedHeight, origWidth, origHeight);
+                    byte[] encoded = TextureCodec.EncodeFromRgba32(resampled, origWidth, origHeight, origFormat, texName);
+
+                    if (!opt.DryRun)
+                    {
+                        origBase["m_TextureFormat"].AsInt = origFormat; // unchanged - keep original's own format
+                        origBase["m_MipCount"].AsInt = 1;
+                        origBase["m_CompleteImageSize"].AsInt = encoded.Length;
+
+                        AssetTypeValueField streamData = origBase["m_StreamData"];
+                        streamData["offset"].AsULong = 0;
+                        streamData["size"].AsInt = 0;
+                        streamData["path"].AsString = string.Empty;
+                        origBase["image data"].AsByteArray = encoded;
+
+                        origInfo.SetNewData(origBase);
+                    }
+                    reencoded++;
+                    fileTouched = true;
                 }
                 else
                 {
+                    if (usedPathIds.Contains(moddedInfo.PathId))
+                    {
+                        Console.WriteLine(
+                            $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId} not present in " +
+                            "original as a Texture2D, but that PathId is already used by a different object - skipping.");
+                        skippedErrors++;
+                        continue;
+                    }
+
                     // No counterpart at all: decode the modded texture and encode it
-                    // fresh into the configured default new-texture format; Phase 3
-                    // inserts it as a brand new object using the SAME baseField
+                    // fresh into the configured default new-texture format, then
+                    // insert it as a brand new object using the SAME baseField we
                     // already read from modded (correct field layout for this Unity
-                    // build), just with the format/image-data fields swapped.
-                    var swEncode = System.Diagnostics.Stopwatch.StartNew();
-                    byte[] moddedRgba = TextureCodec.DecodeToRgba32(
-                        item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
-                    item.FinalEncoded = TextureCodec.EncodeFromRgba32(
-                        moddedRgba, item.ModdedWidth, item.ModdedHeight, opt.NewTextureFormat, item.TexName);
-                    swEncode.Stop();
-                    Interlocked.Add(ref encodeTicks, swEncode.ElapsedTicks);
+                    // build), just with the format/image-data fields swapped - the
+                    // same in-place mutation the "changed" branch above does, only
+                    // targeting a newly created AssetFileInfo in orig instead of an
+                    // existing one.
+                    int moddedFormat = moddedBase["m_TextureFormat"].AsInt;
+                    int moddedWidth = moddedBase["m_Width"].AsInt;
+                    int moddedHeight = moddedBase["m_Height"].AsInt;
+
+                    byte[] moddedRgba = DecodeTextureRgba32(moddedAfileInst, moddedBase, moddedFormat, moddedWidth, moddedHeight, texName);
+                    byte[] encoded = TextureCodec.EncodeFromRgba32(moddedRgba, moddedWidth, moddedHeight, opt.NewTextureFormat, texName);
 
                     Console.WriteLine(
-                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: not present in original - " +
-                        $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({item.ModdedWidth}x{item.ModdedHeight}).");
+                        $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: not present in original - " +
+                        $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({moddedWidth}x{moddedHeight}).");
+
+                    if (!opt.DryRun)
+                    {
+                        moddedBase["m_TextureFormat"].AsInt = opt.NewTextureFormat;
+                        moddedBase["m_MipCount"].AsInt = 1;
+                        moddedBase["m_CompleteImageSize"].AsInt = encoded.Length;
+
+                        AssetTypeValueField streamData = moddedBase["m_StreamData"];
+                        streamData["offset"].AsULong = 0;
+                        streamData["size"].AsInt = 0;
+                        streamData["path"].AsString = string.Empty;
+                        moddedBase["image data"].AsByteArray = encoded;
+
+                        var newInfo = AssetFileInfo.Create(origAf, moddedInfo.PathId, (int)AssetClassID.Texture2D);
+                        newInfo.SetNewData(moddedBase);
+                        origAf.Metadata.AddAssetInfo(newInfo);
+                        usedPathIds.Add(moddedInfo.PathId);
+                    }
+                    addedNew++;
+                    fileTouched = true;
                 }
             }
             catch (Exception ex)
             {
-                item.Error = ex;
                 Console.Error.WriteLine(
-                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: skipped due to error - " +
+                    $"[{fileName}] Texture2D '{texName}' PathId {moddedInfo.PathId}: skipped due to error - " +
                     $"{ex.GetType().Name}: {ex.Message}");
-            }
-        });
-
-        // --- Phase 3: sequential apply -------------------------------------
-        // Pure bookkeeping + the actual mutations now - all the logging
-        // already happened in Phase 1/2 as each texture was decided, so
-        // there's nothing left to print here.
-        foreach (TextureWorkItem item in items)
-        {
-            if (item.PathIdCollision || item.Error != null)
-            {
                 skippedErrors++;
-                continue;
             }
-
-            if (item.HasOriginal)
-            {
-                if (!opt.DryRun)
-                {
-                    AssetTypeValueField origBase = item.OrigBase!;
-                    origBase["m_TextureFormat"].AsInt = item.OrigFormat; // unchanged - keep original's own format
-                    origBase["m_MipCount"].AsInt = 1;
-                    origBase["m_CompleteImageSize"].AsInt = item.FinalEncoded!.Length;
-
-                    AssetTypeValueField streamData = origBase["m_StreamData"];
-                    streamData["offset"].AsULong = 0;
-                    streamData["size"].AsInt = 0;
-                    streamData["path"].AsString = string.Empty;
-                    origBase["image data"].AsByteArray = item.FinalEncoded;
-
-                    item.OrigInfo!.SetNewData(origBase);
-                }
-                reencoded++;
-                fileTouched = true;
-            }
-            else
-            {
-                if (!opt.DryRun)
-                {
-                    AssetTypeValueField moddedBase = item.ModdedBase;
-                    moddedBase["m_TextureFormat"].AsInt = opt.NewTextureFormat;
-                    moddedBase["m_MipCount"].AsInt = 1;
-                    moddedBase["m_CompleteImageSize"].AsInt = item.FinalEncoded!.Length;
-
-                    AssetTypeValueField streamData = moddedBase["m_StreamData"];
-                    streamData["offset"].AsULong = 0;
-                    streamData["size"].AsInt = 0;
-                    streamData["path"].AsString = string.Empty;
-                    moddedBase["image data"].AsByteArray = item.FinalEncoded;
-
-                    var newInfo = AssetFileInfo.Create(origAf, item.PathId, (int)AssetClassID.Texture2D);
-                    newInfo.SetNewData(moddedBase);
-                    origAf.Metadata.AddAssetInfo(newInfo);
-                    usedPathIds.Add(item.PathId);
-                }
-                addedNew++;
-                fileTouched = true;
-            }
-        }
-
-        if (items.Count > 0 || skippedByInlineSizeHeuristic > 0)
-        {
-            double moddedMs = moddedDecodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            double encodeMs = encodeTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            Console.WriteLine(
-                $"[{fileName}] texture timing (summed across all threads, so this can exceed wall time by " +
-                $"~{maxParallelism}x): modded-side decode={moddedMs:N0}ms, re-encode={encodeMs:N0}ms across " +
-                $"{reencoded + addedNew} changed/new textures. {skippedByInlineSizeHeuristic} texture(s) never " +
-                $"decoded at all - still streamed (<= {opt.InlineByteSizeThreshold:N0}B, presumed untouched by " +
-                $"the mod). Parallelism cap: {maxParallelism} (set BUNDLEDOCTOR_MAX_PARALLELISM to override).");
         }
     }
 
-    // Sequential-only: reads through AssetsFileInstance's shared reader/
-    // stream position (TextureFile.ReadTextureFile + FillPictureData), so
-    // this must stay in Phase 1, never called from the parallel Phase 2.
-    private static byte[] ExtractEncodedBytes(
-        AssetsFileInstance afileInst, AssetTypeValueField baseField, string texName)
+    private static byte[] DecodeTextureRgba32(
+        AssetsFileInstance afileInst, AssetTypeValueField baseField, int format, int width, int height, string texName)
     {
+        if (width <= 0 || height <= 0)
+            throw new InvalidDataException($"invalid dimensions for '{texName}': {width}x{height}");
+
         TextureFile tf = TextureFile.ReadTextureFile(baseField);
-        return tf.FillPictureData(afileInst)
+        byte[] encodedData = tf.FillPictureData(afileInst)
             ?? throw new InvalidDataException($"could not load texture data for '{texName}'");
+
+        return TextureCodec.DecodeToRgba32(encodedData, width, height, format, texName);
     }
 
     // --- shared plumbing -----------------------------------------------------
@@ -794,14 +623,6 @@ internal static class TransplantMode
             else if (string.Equals(positional[i], "--new-texture-format", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
             {
                 opt.NewTextureFormat = ParseFormatName(positional[i + 1]);
-                positional.RemoveRange(i, 2);
-                i--;
-            }
-            else if (string.Equals(positional[i], "--inline-size-threshold", StringComparison.OrdinalIgnoreCase) && i + 1 < positional.Count)
-            {
-                if (!long.TryParse(positional[i + 1], out long b) || b < 0)
-                    return null;
-                opt.InlineByteSizeThreshold = b;
                 positional.RemoveRange(i, 2);
                 i--;
             }

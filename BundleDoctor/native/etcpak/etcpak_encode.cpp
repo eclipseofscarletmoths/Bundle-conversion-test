@@ -144,21 +144,6 @@ int main()
         return 2;
     }
 
-    // Wire protocol is R,G,B,A per pixel (see header comment above), but
-    // etcpak's ProcessRGB compressor assumes B,G,R,A byte order internally -
-    // every channel access in ProcessRGB.cpp reads byte offset 0 as Blue and
-    // offset 2 as Red (confirmed by its luma weights: 76/254 sits on offset
-    // 2, matching Rec.601's ~0.299 red coefficient). Swap R and B here so we
-    // hand etcpak what it actually expects; without this, every encoded
-    // texture comes out with red and blue channels swapped.
-    {
-        uint8_t* bytes = reinterpret_cast<uint8_t*>(rgba.data());
-        for (size_t i = 0; i < pixelCount; ++i)
-        {
-            std::swap(bytes[i * 4 + 0], bytes[i * 4 + 2]);
-        }
-    }
-
     const uint32_t paddedW = (width + 3u) & ~3u;
     const uint32_t paddedH = (height + 3u) & ~3u;
     std::vector<uint32_t> padded = PadToBlockGrid(rgba.data(), width, height, paddedW, paddedH);
