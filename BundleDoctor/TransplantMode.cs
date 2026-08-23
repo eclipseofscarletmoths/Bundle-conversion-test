@@ -391,14 +391,16 @@ internal static class TransplantMode
     //   out across cores. This is the phase that used to run one texture at
     //   a time and is what made a bundle with a few hundred large
     //   ASTC/DXT5Crunched atlases take 18+ minutes and blow past the job
-    //   timeout. Logging is deliberately NOT done in this phase - writing
-    //   to Console concurrently from multiple threads interleaves output
-    //   into garbage.
+    //   timeout. Per-texture progress is logged HERE, as each item
+    //   finishes, not deferred to Phase 3 - Console.WriteLine/Error are
+    //   internally synchronized, so concurrent lines never garble, they can
+    //   just print out of enumeration order. Deferring all logging to
+    //   Phase 3 was tried first and made large bundles look hung: nothing
+    //   printed until the entire file's texture batch finished decoding.
     //
     //   Phase 3 (sequential) - apply the results back onto the shared
-    //   AssetsFile/AssetFileInfo state (mutation has to be ordered/single-
-    //   threaded regardless), and log in the same per-texture order as
-    //   before so the run's console output reads the same way it always has.
+    //   AssetsFile/AssetFileInfo state; mutation has to be ordered/single-
+    //   threaded regardless of when logging happens.
     private static void TransplantTextures(
         AssetsManager originalManager,
         AssetsManager moddedManager,
@@ -461,6 +463,9 @@ internal static class TransplantMode
                 else if (usedPathIds.Contains(moddedInfo.PathId))
                 {
                     item.PathIdCollision = true;
+                    Console.WriteLine(
+                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId} not present in " +
+                        "original as a Texture2D, but that PathId is already used by a different object - skipping.");
                 }
             }
             catch (Exception ex)
@@ -469,7 +474,15 @@ internal static class TransplantMode
             }
         }
 
-        // --- Phase 2: parallel decode/diff/encode ------------------------
+        // --- Phase 2: parallel decode/diff/encode -------------------------
+        // Progress logging happens HERE, immediately as each texture
+        // finishes, not batched into Phase 3 - Console.WriteLine/Error are
+        // internally synchronized (System.IO.SyncTextWriter), so concurrent
+        // calls from multiple threads never interleave mid-line into
+        // garbled output; the only observable effect is that completed
+        // textures may print out of their original enumeration order, which
+        // is a fair trade for not going silent on a large bundle for
+        // however long the whole batch takes.
         Parallel.ForEach(items, item =>
         {
             if (item.Error != null || item.PathIdCollision)
@@ -498,6 +511,13 @@ internal static class TransplantMode
                         origGrid, moddedGrid, DefaultGridSize, opt.CellMagnitudeThreshold);
                     item.Changed = item.AreaFraction >= opt.MinChangedAreaFraction;
 
+                    Console.WriteLine(
+                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: " +
+                        $"orig {item.OrigWidth}x{item.OrigHeight} {TextureCodec.FormatName(item.OrigFormat)} vs " +
+                        $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)}, " +
+                        $"p95={item.P95:F2}, changed-area={item.AreaFraction:P1}" +
+                        (item.Changed ? " -> CHANGED" : " -> unchanged"));
+
                     if (item.Changed)
                     {
                         byte[] resampled = TextureCodec.ResampleBilinear(
@@ -517,44 +537,35 @@ internal static class TransplantMode
                         item.ModdedEncoded!, item.ModdedWidth, item.ModdedHeight, item.ModdedFormat, item.TexName);
                     item.FinalEncoded = TextureCodec.EncodeFromRgba32(
                         moddedRgba, item.ModdedWidth, item.ModdedHeight, opt.NewTextureFormat, item.TexName);
+
+                    Console.WriteLine(
+                        $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: not present in original - " +
+                        $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({item.ModdedWidth}x{item.ModdedHeight}).");
                 }
             }
             catch (Exception ex)
             {
                 item.Error = ex;
+                Console.Error.WriteLine(
+                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: skipped due to error - " +
+                    $"{ex.GetType().Name}: {ex.Message}");
             }
         });
 
-        // --- Phase 3: sequential apply + log ------------------------------
+        // --- Phase 3: sequential apply -------------------------------------
+        // Pure bookkeeping + the actual mutations now - all the logging
+        // already happened in Phase 1/2 as each texture was decided, so
+        // there's nothing left to print here.
         foreach (TextureWorkItem item in items)
         {
-            if (item.PathIdCollision)
+            if (item.PathIdCollision || item.Error != null)
             {
-                Console.WriteLine(
-                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId} not present in " +
-                    "original as a Texture2D, but that PathId is already used by a different object - skipping.");
-                skippedErrors++;
-                continue;
-            }
-
-            if (item.Error != null)
-            {
-                Console.Error.WriteLine(
-                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: skipped due to error - " +
-                    $"{item.Error.GetType().Name}: {item.Error.Message}");
                 skippedErrors++;
                 continue;
             }
 
             if (item.HasOriginal)
             {
-                Console.WriteLine(
-                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: " +
-                    $"orig {item.OrigWidth}x{item.OrigHeight} {TextureCodec.FormatName(item.OrigFormat)} vs " +
-                    $"modded {item.ModdedWidth}x{item.ModdedHeight} {TextureCodec.FormatName(item.ModdedFormat)}, " +
-                    $"p95={item.P95:F2}, changed-area={item.AreaFraction:P1}" +
-                    (item.Changed ? " -> CHANGED" : " -> unchanged"));
-
                 if (!item.Changed)
                 {
                     unchanged++;
@@ -581,10 +592,6 @@ internal static class TransplantMode
             }
             else
             {
-                Console.WriteLine(
-                    $"[{fileName}] Texture2D '{item.TexName}' PathId {item.PathId}: not present in original - " +
-                    $"adding as {TextureCodec.FormatName(opt.NewTextureFormat)} ({item.ModdedWidth}x{item.ModdedHeight}).");
-
                 if (!opt.DryRun)
                 {
                     AssetTypeValueField moddedBase = item.ModdedBase;
