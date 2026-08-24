@@ -44,6 +44,15 @@ internal static class Etc2Encoder
         if (!process.Start())
             throw new InvalidOperationException($"failed to start vendored etcpak ETC2 encoder '{encoderPath}'");
 
+        // etcpak's vendored ProcessRGB compressor reads its source buffer as
+        // BGRA (src[0]=B, src[1]=G, src[2]=R - see e.g. Average()/Planar() in
+        // ProcessRGB.cpp), not RGBA despite the wire protocol's own "raw
+        // RGBA8" naming. Every other codec path in TextureCodec.cs converts
+        // BGRA->RGBA on decode (BgraToRgba); this is the mirror-image
+        // RGBA->BGRA conversion needed before *encoding*, or every ETC2
+        // texture comes out with red and blue swapped.
+        byte[] bgra32 = RgbaToBgra(rgba32);
+
         using (process.StandardInput.BaseStream)
         {
             Span<byte> header = stackalloc byte[12];
@@ -51,7 +60,7 @@ internal static class Etc2Encoder
             WriteUInt32LE(header[4..8], checked((uint)height));
             WriteUInt32LE(header[8..12], checked((uint)outputFormat));
             process.StandardInput.BaseStream.Write(header);
-            process.StandardInput.BaseStream.Write(rgba32, 0, rgba32.Length);
+            process.StandardInput.BaseStream.Write(bgra32, 0, bgra32.Length);
         }
 
         // Output is bounded by 16 bytes per 4x4 block, so ReadToEnd is safe
@@ -123,6 +132,19 @@ internal static class Etc2Encoder
         using var output = new MemoryStream();
         stream.CopyTo(output);
         return output.ToArray();
+    }
+
+    private static byte[] RgbaToBgra(byte[] rgba)
+    {
+        var bgra = new byte[rgba.Length];
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            bgra[i + 0] = rgba[i + 2];
+            bgra[i + 1] = rgba[i + 1];
+            bgra[i + 2] = rgba[i + 0];
+            bgra[i + 3] = rgba[i + 3];
+        }
+        return bgra;
     }
 
     private static void WriteUInt32LE(Span<byte> destination, uint value)
