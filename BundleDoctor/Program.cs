@@ -8,7 +8,9 @@
 //   - decodes DXT/DXT5Crunched using Kyaru.Texture2DDecoder (the Unity Texture2D
 //     decoder used by AssetStudio), with explicit UnityCrunch unpacking for format 29
 //   - re-encodes every converted texture to a configurable output format
-//     (default: RGBA32); ASTC 4x4/6x6 use AstcSharp and ETC2 uses the optional native encoder
+//     (default: RGBA32); ASTC 4x4/6x6/8x8 and ETC2 both go through vendored
+//     native encoders (astcenc and etcpak respectively - see native/astcenc/
+//     and native/etcpak/); AstcSharp is kept only for ASTC decode
 //   - moves converted texture data inline and clears m_StreamData so the rewritten
 //     Texture2D does not depend on hand-written .resS offsets
 //   - fully decompresses compressed input bundles before any asset/texture mutation
@@ -840,6 +842,12 @@ internal static class Program
         }
     }
 
+    // See TextureCodec.EncodeAstc's header comment: encoding goes through the
+    // vendored native astcenc encoder (NativeAstcEncoder.cs) rather than
+    // AstcSharp.AstcEncoder.CompressImage now, for speed. outputFormat is
+    // unused by the encode itself; kept in the signature since callers above
+    // already have it and it's useful context in error messages if this ever
+    // needs to report which Unity format it was encoding for.
     private static byte[] EncodeAstc(
         byte[] rgba32,
         int width,
@@ -848,13 +856,6 @@ internal static class Program
         int outputFormat,
         string texName)
     {
-        using var source = new MemoryStream(rgba32, writable: false);
-        using var destination = new MemoryStream();
-
-        var footprint = Footprint.FromFootprintType(footprintType);
-        AstcEncoder.CompressImage(source, destination, width, height, footprint);
-        byte[] blocks = destination.ToArray();
-
         int blockWidth = footprintType switch
         {
             FootprintType.Footprint4x4 => 4,
@@ -862,19 +863,8 @@ internal static class Program
             FootprintType.Footprint8x8 => 8,
             _ => throw new ArgumentOutOfRangeException(nameof(footprintType), $"Unsupported ASTC footprint {footprintType}")
         };
-        int expectedSize = checked(
-            ((width + blockWidth - 1) / blockWidth) *
-            ((height + blockWidth - 1) / blockWidth) *
-            16);
 
-        if (blocks.Length != expectedSize)
-        {
-            throw new InvalidDataException(
-                $"ASTC {blockWidth}x{blockWidth} size mismatch for '{texName}': " +
-                $"got {blocks.Length:N0}, expected {expectedSize:N0}");
-        }
-
-        return blocks;
+        return NativeAstcEncoder.Encode(rgba32, width, height, blockWidth, blockWidth, texName);
     }
 
     private static byte[] DecodeRGB24(byte[] data, int width, int height)
@@ -932,12 +922,7 @@ internal static class Program
 
     private static byte[] EncodeAstc6x6(byte[] rgba32, int width, int height)
     {
-        using var source = new MemoryStream(rgba32, writable: false);
-        using var destination = new MemoryStream();
-
-        var footprint = Footprint.FromFootprintType(FootprintType.Footprint6x6);
-        AstcEncoder.CompressImage(source, destination, width, height, footprint);
-        return destination.ToArray();
+        return NativeAstcEncoder.Encode(rgba32, width, height, blockWidth: 6, blockHeight: 6, texName: "<EncodeAstc6x6>");
     }
 
     private static byte[] BgraToRgba(byte[] bgra)

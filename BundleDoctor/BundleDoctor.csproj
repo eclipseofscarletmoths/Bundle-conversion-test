@@ -39,6 +39,36 @@
     <Copy SourceFiles="@(EtcpakBinary)" DestinationFolder="$(OutputPath)/native/etcpak/build" SkipUnchangedFiles="true" />
   </Target>
 
+  <!-- ASTC is implemented by the vendored ARM astc-encoder (astcenc) C++
+       encoder (a CLI-free build of just its compressor core - see
+       native/astcenc/CMakeLists.txt), replacing the pure-managed AstcSharp
+       encoder that made this pipeline's ASTC path the bottleneck. Same
+       build/copy shape as the etcpak targets above. -->
+  <Target Name="BuildVendoredAstcencEncoder" BeforeTargets="Build">
+    <Exec Command="cmake -S &quot;$(MSBuildProjectDirectory)/native/astcenc&quot; -B &quot;$(MSBuildProjectDirectory)/native/astcenc/build&quot; -DCMAKE_BUILD_TYPE=Release" />
+    <Exec Command="cmake --build &quot;$(MSBuildProjectDirectory)/native/astcenc/build&quot; --config Release --parallel" />
+  </Target>
+
+  <Target Name="CopyVendoredAstcencEncoderToPublish" AfterTargets="Publish">
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/astcenc/build/astcenc_encode')">
+      <PublishedAstcencBinary Include="$(MSBuildProjectDirectory)/native/astcenc/build/astcenc_encode" />
+    </ItemGroup>
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/astcenc/build/Release/astcenc_encode.exe')">
+      <PublishedAstcencBinary Include="$(MSBuildProjectDirectory)/native/astcenc/build/Release/astcenc_encode.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PublishedAstcencBinary)" DestinationFolder="$(PublishDir)/native/astcenc/build" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyVendoredAstcencEncoder" AfterTargets="Build">
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/astcenc/build/astcenc_encode')">
+      <AstcencBinary Include="$(MSBuildProjectDirectory)/native/astcenc/build/astcenc_encode" />
+    </ItemGroup>
+    <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)/native/astcenc/build/Release/astcenc_encode.exe')">
+      <AstcencBinary Include="$(MSBuildProjectDirectory)/native/astcenc/build/Release/astcenc_encode.exe" />
+    </ItemGroup>
+    <Copy SourceFiles="@(AstcencBinary)" DestinationFolder="$(OutputPath)/native/astcenc/build" SkipUnchangedFiles="true" />
+  </Target>
+
   <ItemGroup>
     <!-- Schema-driven asset/bundle reading & writing -->
     <PackageReference Include="AssetsTools.NET" Version="3.0.2" />
@@ -53,8 +83,11 @@
     <PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.1" />
     <PackageReference Include="Kyaru.Texture2DDecoder.Linux" Version="0.2.0" />
 
-    <!-- Pure C# ASTC encoder. Converts RGBA32 source pixels into raw ASTC 6x6 blocks without
-         requiring an external astcenc executable. -->
+    <!-- Pure C# ASTC codec. Encoding now goes through the vendored native astcenc
+         executable instead (see native/astcenc/, NativeAstcEncoder.cs) - AstcSharp's
+         managed encoder was the bottleneck this project needed to remove. AstcSharp
+         itself is kept only for ASTC *decode* (TextureCodec.DecodeAstc), which was
+         never the slow path. -->
     <PackageReference Include="AstcSharp" Version="3.1.0" />
 
     <!-- Real standard/fast LZ4 block encoder+decoder (LZ4Level.L00_FAST), used only by

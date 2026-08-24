@@ -51,6 +51,16 @@ jobs:
           path: BundleDoctor/native/etcpak/build
           key: etcpak-build-${{ runner.os }}-${{ hashFiles('BundleDoctor/native/etcpak/**') }}
 
+      # Same reasoning as the etcpak cache above, for the vendored astcenc
+      # build. This one is the more valuable cache hit of the two - a cold
+      # astcenc build compiles the whole compressor core (endpoint/weight
+      # search, partitioning tables, etc.), not just ProcessRGB.cpp.
+      - name: Cache vendored astcenc build
+        uses: actions/cache@v4
+        with:
+          path: BundleDoctor/native/astcenc/build
+          key: astcenc-build-${{ runner.os }}-${{ hashFiles('BundleDoctor/native/astcenc/**') }}
+
       - name: Restore & build converter
         run: dotnet build BundleDoctor/BundleDoctor.csproj -c Release -o build
 
