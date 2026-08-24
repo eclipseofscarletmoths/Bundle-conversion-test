@@ -61,6 +61,16 @@ internal static class Program
     private const int kTargetWindows64 = 19;
     private const int kTargetIOS = 9;
 
+    // Unity Editor version this pipeline is pinned to. Class-database (.tpk)
+    // resolution uses this constant instead of the bundle's own serialized
+    // af.Metadata.UnityVersion string - that field can be obfuscated/stripped
+    // (see the UnityCrunch comment below), and even when present it's whatever
+    // version modded/third-party bundles happened to ship with, not necessarily
+    // the version this pipeline's TypeTree handling has actually been built
+    // and verified against. Update this if/when Limbus Company's engine version
+    // changes.
+    internal const string kTargetUnityVersion = "6000.3.12f1";
+
     // TextureFormat values relevant to this pipeline
     private const int kFmtRGB24 = 3;
     private const int kFmtRGBA32 = 4;
@@ -349,7 +359,7 @@ internal static class Program
 
             if (tpkPath != null)
             {
-                manager.LoadClassDatabaseFromPackage(af.Metadata.UnityVersion);
+                manager.LoadClassDatabaseFromPackage(kTargetUnityVersion);
             }
 
             bool fileTouched = false;

@@ -184,8 +184,10 @@ internal static class TransplantMode
 
                 if (opt.TpkPath != null)
                 {
-                    originalManager.LoadClassDatabaseFromPackage(origAfileInst.file.Metadata.UnityVersion);
-                    moddedManager.LoadClassDatabaseFromPackage(moddedAfileInst.file.Metadata.UnityVersion);
+                    // Pinned to Program.kTargetUnityVersion rather than each bundle's own
+                    // af.Metadata.UnityVersion - see that constant's comment for why.
+                    originalManager.LoadClassDatabaseFromPackage(Program.kTargetUnityVersion);
+                    moddedManager.LoadClassDatabaseFromPackage(Program.kTargetUnityVersion);
                 }
 
                 bool fileTouched = false;
